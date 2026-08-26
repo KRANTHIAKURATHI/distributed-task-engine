@@ -4,18 +4,41 @@ import com.taskengine.entity.Job;
 import com.taskengine.enums.JobStatus;
 import com.taskengine.queue.JobQueue;
 import com.taskengine.repository.JobRepository;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Component
-public class JobWorker {
+public class JobWorker implements SmartLifecycle {
 
     private final WorkerIdentity workerIdentity;
     private final JobQueue jobQueue;
     private final JobRepository jobRepository;
+
+    /*
+     * true  -> worker accepts new jobs
+     * false -> shutdown has started
+     */
+    private final AtomicBoolean running =
+            new AtomicBoolean(true);
+
+    /*
+     * true -> worker currently executing a job
+     */
+    private final AtomicBoolean jobRunning =
+            new AtomicBoolean(false);
+
+    /*
+     * Current job being executed.
+     *
+     * JobHeartbeat uses this during graceful
+     * shutdown to keep the lease alive.
+     */
+    private volatile Job currentJob;
 
     public JobWorker(
             WorkerIdentity workerIdentity,
@@ -27,61 +50,176 @@ public class JobWorker {
         this.jobRepository = jobRepository;
     }
 
+    /*
+     * ==========================================
+     * WORKER LOOP
+     * ==========================================
+     */
+
     @Scheduled(fixedDelay = 1000)
     public void run() {
+
+        /*
+         * Do not accept new jobs after shutdown
+         * begins.
+         */
+        if (!running.get()) {
+            return;
+        }
+
         processNextJob();
     }
 
+    /*
+     * ==========================================
+     * PROCESS NEXT JOB
+     * ==========================================
+     */
+
     public void processNextJob() {
 
-        // Take a job from Redis
-        String jobId = jobQueue.claimJob();
+        /*
+         * Double-check shutdown state before
+         * touching Redis.
+         */
+        if (!running.get()) {
+            return;
+        }
+
+        String workerId =
+                workerIdentity.getWorkerId();
+
+        System.out.println(
+                "WORKER WAITING FOR JOB: "
+                        + workerId
+        );
+
+        String jobId;
+
+        try {
+
+            jobId =
+                    jobQueue.claimJob(workerId);
+
+        } catch (Exception e) {
+
+            /*
+             * Redis may be shutting down.
+             *
+             * Do not turn this into a failed job.
+             */
+            if (!running.get()) {
+
+                System.out.println(
+                        "WORKER SHUTDOWN: "
+                                + "Redis connection closed"
+                );
+
+                return;
+            }
+
+            System.out.println(
+                    "REDIS CLAIM ERROR: "
+                            + e.getMessage()
+            );
+
+            return;
+        }
 
         if (jobId == null) {
             return;
         }
 
-        UUID id = UUID.fromString(jobId);
+        /*
+         * We now own a job that was received
+         * from Redis.
+         */
+        jobRunning.set(true);
 
-        // Find the job in PostgreSQL
-        Job job = jobRepository.findById(id)
-                .orElse(null);
+        System.out.println(
+                "WORKER RECEIVED JOB: "
+                        + jobId
+        );
 
-        if (job == null) {
+        UUID id;
+
+        try {
+
+            id =
+                    UUID.fromString(jobId);
+
+        } catch (IllegalArgumentException e) {
+
             System.out.println(
-                    "Job not found: " + jobId
+                    "INVALID JOB ID FROM REDIS: "
+                            + jobId
             );
+
+            jobRunning.set(false);
+
             return;
         }
+
+        /*
+         * ==========================================
+         * LOAD JOB
+         * ==========================================
+         */
+
+        Job job =
+                jobRepository.findById(id)
+                        .orElse(null);
+
+        if (job == null) {
+
+            System.out.println(
+                    "JOB NOT FOUND IN DATABASE: "
+                            + jobId
+            );
+
+            jobRunning.set(false);
+
+            return;
+        }
+
+        /*
+         * Make current job visible to heartbeat.
+         */
+        currentJob = job;
 
         try {
 
             /*
-             * ==============================
-             * CLAIM THE JOB
-             * ==============================
+             * ======================================
+             * CLAIM JOB
+             * ======================================
              */
 
-            LocalDateTime now = LocalDateTime.now();
+            LocalDateTime now =
+                    LocalDateTime.now();
 
-            job.setStatus(JobStatus.PROCESSING);
-
-            // Identify which worker owns this job
-            job.setWorkerId(
-                    workerIdentity.getWorkerId()
+            job.setStatus(
+                    JobStatus.PROCESSING
             );
 
-            // Record when the job was claimed
-            job.setClaimedAt(now);
+            job.setWorkerId(
+                    workerId
+            );
 
-            // TEMPORARY: 10-second lease
-            // We are using 10 seconds so that
-            // the 40-second test job expires.
+            job.setClaimedAt(
+                    now
+            );
+
+            /*
+             * 30-second lease.
+             */
             job.setLeaseUntil(
                     now.plusSeconds(30)
             );
 
-            job.setUpdatedAt(now);
+            job.setUpdatedAt(
+                    now
+            );
 
             jobRepository.save(job);
 
@@ -90,49 +228,216 @@ public class JobWorker {
             );
 
             System.out.println(
-                    "Worker: "
-                            + workerIdentity.getWorkerId()
+                    "WORKER: "
+                            + workerId
             );
 
             System.out.println(
-                    "Claimed job: "
+                    "CLAIMED JOB: "
                             + job.getId()
             );
 
             System.out.println(
-                    "Lease until: "
+                    "ATTEMPT: "
+                            + (job.getAttemptCount() + 1)
+                            + "/"
+                            + job.getMaxAttempts()
+            );
+
+            System.out.println(
+                    "LEASE UNTIL: "
                             + job.getLeaseUntil()
             );
 
+            System.out.println(
+                    "========================================"
+            );
+
             /*
-             * ==============================
+             * ======================================
              * EXECUTE JOB
-             * ==============================
+             * ======================================
              */
 
             System.out.println(
-                    "Processing job: "
+                    "PROCESSING JOB: "
                             + job.getId()
             );
 
             executeJob(job);
 
             /*
-             * ==============================
-             * JOB COMPLETED
-             * ==============================
+             * ======================================
+             * COMPLETE JOB
+             * ======================================
+             *
+             * IMPORTANT:
+             *
+             * Do NOT use:
+             *
+             * job.setStatus(COMPLETED);
+             * jobRepository.save(job);
+             *
+             * because another worker may have
+             * reclaimed this job.
+             *
+             * Instead perform an atomic ownership
+             * check in PostgreSQL.
              */
 
-            job.setStatus(JobStatus.COMPLETED);
+            LocalDateTime completionTime =
+                    LocalDateTime.now();
 
-            // Remove worker ownership
-            job.setWorkerId(null);
+            int updated =
+                    jobRepository.completeJobIfOwned(
+                            job.getId(),
+                            workerId,
+                            JobStatus.PROCESSING,
+                            JobStatus.COMPLETED,
+                            completionTime
+                    );
 
-            // Remove claim timestamp
-            job.setClaimedAt(null);
+            if (updated == 1) {
 
-            // Remove lease
-            job.setLeaseUntil(null);
+                /*
+                 * We still own the job.
+                 */
+                System.out.println(
+                        "COMPLETED JOB: "
+                                + job.getId()
+                );
+
+            } else {
+
+                /*
+                 * Another worker/reaper changed
+                 * the job before we completed it.
+                 */
+                System.out.println(
+                        "========================================"
+                );
+
+                System.out.println(
+                        "JOB COMPLETION REJECTED"
+                );
+
+                System.out.println(
+                        "LEASE OR OWNERSHIP LOST: "
+                                + job.getId()
+                );
+
+                System.out.println(
+                        "WORKER: "
+                                + workerId
+                );
+
+                System.out.println(
+                        "The job may have been "
+                                + "reclaimed by another worker."
+                );
+
+                System.out.println(
+                        "========================================"
+                );
+            }
+
+        } catch (Exception e) {
+
+            /*
+             * ======================================
+             * JOB FAILED
+             * ======================================
+             */
+
+            handleFailure(
+                    job,
+                    e
+            );
+
+        } finally {
+
+            /*
+             * Job execution is finished.
+             */
+            currentJob = null;
+
+            jobRunning.set(false);
+        }
+    }
+
+    /*
+     * ==========================================
+     * FAILURE HANDLING
+     * ==========================================
+     */
+
+    private void handleFailure(
+            Job job,
+            Exception e
+    ) {
+
+        /*
+         * If the lease was already lost, don't
+         * blindly overwrite the state that another
+         * worker may have established.
+         *
+         * For now we preserve the existing retry
+         * behavior.
+         */
+
+        int nextAttempt =
+                job.getAttemptCount() + 1;
+
+        job.setAttemptCount(
+                nextAttempt
+        );
+
+        job.setLastError(
+                e.getMessage()
+        );
+
+        job.setWorkerId(null);
+
+        job.setClaimedAt(null);
+
+        job.setLeaseUntil(null);
+
+        /*
+         * ======================================
+         * RETRY AVAILABLE
+         * ======================================
+         */
+
+        if (nextAttempt < job.getMaxAttempts()) {
+
+            /*
+             * Exponential backoff:
+             *
+             * attempt 1 -> 2 seconds
+             * attempt 2 -> 4 seconds
+             * attempt 3 -> 8 seconds
+             * attempt 4 -> 16 seconds
+             */
+
+            long delaySeconds =
+                    (long) Math.pow(
+                            2,
+                            nextAttempt
+                    );
+
+            LocalDateTime retryAt =
+                    LocalDateTime.now()
+                            .plusSeconds(
+                                    delaySeconds
+                            );
+
+            job.setStatus(
+                    JobStatus.RETRYING
+            );
+
+            job.setScheduledAt(
+                    retryAt
+            );
 
             job.setUpdatedAt(
                     LocalDateTime.now()
@@ -141,36 +446,54 @@ public class JobWorker {
             jobRepository.save(job);
 
             System.out.println(
-                    "Completed job: "
+                    "========================================"
+            );
+
+            System.out.println(
+                    "JOB FAILED: "
                             + job.getId()
+            );
+
+            System.out.println(
+                    "ERROR: "
+                            + e.getMessage()
+            );
+
+            System.out.println(
+                    "ATTEMPT: "
+                            + nextAttempt
+                            + "/"
+                            + job.getMaxAttempts()
+            );
+
+            System.out.println(
+                    "RETRY DELAY: "
+                            + delaySeconds
+                            + " seconds"
+            );
+
+            System.out.println(
+                    "RETRY AT: "
+                            + retryAt
             );
 
             System.out.println(
                     "========================================"
             );
 
-        } catch (Exception e) {
+        } else {
 
             /*
-             * ==============================
-             * JOB FAILED
-             * ==============================
+             * ======================================
+             * NO RETRIES LEFT
+             * ======================================
              */
 
-            job.setStatus(JobStatus.FAILED);
-
-            job.setLastError(
-                    e.getMessage()
+            job.setStatus(
+                    JobStatus.DEAD
             );
 
-            // Remove worker ownership
-            job.setWorkerId(null);
-
-            // Remove claim timestamp
-            job.setClaimedAt(null);
-
-            // Remove lease
-            job.setLeaseUntil(null);
+            job.setScheduledAt(null);
 
             job.setUpdatedAt(
                     LocalDateTime.now()
@@ -179,16 +502,34 @@ public class JobWorker {
             jobRepository.save(job);
 
             System.out.println(
-                    "Failed job: "
+                    "========================================"
+            );
+
+            System.out.println(
+                    "JOB PERMANENTLY FAILED: "
                             + job.getId()
             );
 
             System.out.println(
-                    "Error: "
-                            + e.getMessage()
+                    "STATUS: DEAD"
+            );
+
+            System.out.println(
+                    "ATTEMPTS: "
+                            + nextAttempt
+            );
+
+            System.out.println(
+                    "========================================"
             );
         }
     }
+
+    /*
+     * ==========================================
+     * JOB EXECUTION
+     * ==========================================
+     */
 
     private void executeJob(Job job) {
 
@@ -204,20 +545,17 @@ public class JobWorker {
                 try {
 
                     /*
-                     * TEMPORARY TEST
+                     * 15-second test job.
                      *
-                     * Job takes 40 seconds.
-                     * Lease lasts 10 seconds.
-                     *
-                     * Therefore, the lease should
-                     * expire while the job is running.
+                     * Keep this for crash/shutdown
+                     * testing.
                      */
-
-                    Thread.sleep(60000);
+                    Thread.sleep(15000);
 
                 } catch (InterruptedException e) {
 
-                    Thread.currentThread().interrupt();
+                    Thread.currentThread()
+                            .interrupt();
 
                     throw new RuntimeException(
                             "Job interrupted",
@@ -231,5 +569,145 @@ public class JobWorker {
                             + job.getType()
             );
         }
+    }
+
+    /*
+     * ==========================================
+     * SMART LIFECYCLE
+     * ==========================================
+     */
+
+    @Override
+    public boolean isRunning() {
+
+        return running.get();
+    }
+
+    @Override
+    public boolean isAutoStartup() {
+
+        return true;
+    }
+
+    @Override
+    public int getPhase() {
+
+        return 100;
+    }
+
+    @Override
+    public void start() {
+
+        running.set(true);
+
+        System.out.println(
+                "WORKER STARTED: "
+                        + workerIdentity.getWorkerId()
+        );
+    }
+
+    @Override
+    public void stop() {
+
+        running.set(false);
+
+        System.out.println(
+                "WORKER STOPPED"
+        );
+    }
+
+    /*
+     * ==========================================
+     * GRACEFUL SHUTDOWN
+     * ==========================================
+     */
+
+    @Override
+    public void stop(Runnable callback) {
+
+        System.out.println(
+                "========================================"
+        );
+
+        System.out.println(
+                "GRACEFUL SHUTDOWN STARTED"
+        );
+
+        System.out.println(
+                "WORKER: "
+                        + workerIdentity.getWorkerId()
+        );
+
+        /*
+         * Stop accepting NEW jobs.
+         */
+        running.set(false);
+
+        System.out.println(
+                "WORKER STOPPED ACCEPTING NEW JOBS"
+        );
+
+        /*
+         * Wait for the current job to finish.
+         *
+         * JobHeartbeat continues renewing its
+         * lease while this happens.
+         */
+        while (jobRunning.get()) {
+
+            System.out.println(
+                    "WAITING FOR CURRENT JOB TO FINISH..."
+            );
+
+            try {
+
+                Thread.sleep(500);
+
+            } catch (InterruptedException e) {
+
+                Thread.currentThread()
+                        .interrupt();
+
+                System.out.println(
+                        "SHUTDOWN WAIT INTERRUPTED"
+                );
+
+                break;
+            }
+        }
+
+        System.out.println(
+                "CURRENT JOB FINISHED"
+        );
+
+        System.out.println(
+                "WORKER SHUTDOWN COMPLETE"
+        );
+
+        System.out.println(
+                "========================================"
+        );
+
+        /*
+         * Tell Spring lifecycle processing that
+         * this worker has completely stopped.
+         */
+        callback.run();
+    }
+
+    /*
+     * ==========================================
+     * CURRENT JOB ACCESS
+     * ==========================================
+     */
+
+    public Job getCurrentJob() {
+
+        return currentJob;
+    }
+
+    public boolean isJobRunning() {
+
+        return jobRunning.get();
     }
 }

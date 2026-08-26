@@ -15,13 +15,16 @@ public class JobHeartbeat {
 
     private final JobRepository jobRepository;
     private final WorkerIdentity workerIdentity;
+    private final JobWorker jobWorker;
 
     public JobHeartbeat(
             JobRepository jobRepository,
-            WorkerIdentity workerIdentity
+            WorkerIdentity workerIdentity,
+            JobWorker jobWorker
     ) {
         this.jobRepository = jobRepository;
         this.workerIdentity = workerIdentity;
+        this.jobWorker = jobWorker;
     }
 
     @Scheduled(fixedRate = 5000)
@@ -34,6 +37,12 @@ public class JobHeartbeat {
         LocalDateTime now =
                 LocalDateTime.now();
 
+        /*
+         * ==========================================
+         * NORMAL PROCESSING JOBS
+         * ==========================================
+         */
+
         List<Job> jobs =
                 jobRepository.findByStatusAndWorkerId(
                         JobStatus.PROCESSING,
@@ -42,34 +51,93 @@ public class JobHeartbeat {
 
         for (Job job : jobs) {
 
-            LocalDateTime newLease =
-                    now.plusSeconds(10);
+            renewJob(job, workerId, now);
+        }
 
-            int updated =
-                    jobRepository.renewLease(
-                            job.getId(),
-                            workerId,
-                            JobStatus.PROCESSING,
-                            newLease,
-                            now
-                    );
+        /*
+         * ==========================================
+         * GRACEFUL SHUTDOWN
+         * ==========================================
+         *
+         * During shutdown, the scheduled heartbeat
+         * may stop before the current job finishes.
+         *
+         * Explicitly check the current job so its
+         * lease remains alive.
+         */
 
-            if (updated == 1) {
+        Job currentJob =
+                jobWorker.getCurrentJob();
 
-                System.out.println(
-                        "HEARTBEAT: renewed job "
-                                + job.getId()
-                                + " until "
-                                + newLease
-                );
+        if (currentJob != null
+                && jobWorker.isJobRunning()
+                && currentJob.getStatus()
+                == JobStatus.PROCESSING) {
 
-            } else {
+            /*
+             * Avoid duplicate renewal if the job was
+             * already included in the database query.
+             */
+            boolean alreadyRenewed =
+                    jobs.stream()
+                            .anyMatch(
+                                    job ->
+                                            job.getId()
+                                                    .equals(
+                                                            currentJob.getId()
+                                                    )
+                            );
 
-                System.out.println(
-                        "HEARTBEAT FAILED: lease lost for job "
-                                + job.getId()
+            if (!alreadyRenewed) {
+
+                renewJob(
+                        currentJob,
+                        workerId,
+                        now
                 );
             }
+        }
+    }
+
+    /*
+     * ==========================================
+     * RENEW ONE JOB
+     * ==========================================
+     */
+
+    private void renewJob(
+            Job job,
+            String workerId,
+            LocalDateTime now
+    ) {
+
+        LocalDateTime newLease =
+                now.plusSeconds(10);
+
+        int updated =
+                jobRepository.renewLease(
+                        job.getId(),
+                        workerId,
+                        JobStatus.PROCESSING,
+                        newLease,
+                        now
+                );
+
+        if (updated == 1) {
+
+            System.out.println(
+                    "HEARTBEAT: renewed job "
+                            + job.getId()
+                            + " until "
+                            + newLease
+            );
+
+        } else {
+
+            System.out.println(
+                    "HEARTBEAT FAILED: lease lost for job "
+                            + job.getId()
+            );
         }
     }
 }
