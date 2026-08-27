@@ -61,8 +61,6 @@ public class JobService {
      * ==========================================
      * DLQ INSPECTION
      * ==========================================
-     *
-     * Returns all permanently failed jobs.
      */
 
     public List<Job> getDeadJobs() {
@@ -78,9 +76,6 @@ public class JobService {
      * ==========================================
      *
      * DEAD → PENDING
-     *
-     * Reset execution state and put the job
-     * back into Redis.
      */
 
     @Transactional
@@ -118,34 +113,16 @@ public class JobService {
                 JobStatus.PENDING
         );
 
-        /*
-         * Start a completely new retry cycle.
-         */
         job.setAttemptCount(0);
 
-        /*
-         * Remove previous worker ownership.
-         */
         job.setWorkerId(null);
 
-        /*
-         * Remove previous claim information.
-         */
         job.setClaimedAt(null);
 
-        /*
-         * Remove old lease.
-         */
         job.setLeaseUntil(null);
 
-        /*
-         * Remove previous failure reason.
-         */
         job.setLastError(null);
 
-        /*
-         * Make it immediately eligible.
-         */
         job.setScheduledAt(
                 LocalDateTime.now()
         );
@@ -155,14 +132,16 @@ public class JobService {
         );
 
         /*
-         * Save PostgreSQL state first.
+         * Save PostgreSQL first.
          */
+
         Job savedJob =
                 jobRepository.save(job);
 
         /*
-         * Then put the job back into Redis.
+         * Put the job back into Redis.
          */
+
         jobQueue.enqueue(
                 savedJob.getId()
         );
@@ -195,5 +174,153 @@ public class JobService {
         );
 
         return savedJob;
+    }
+
+    /*
+     * ==========================================
+     * CANCEL JOB
+     * ==========================================
+     */
+
+    @Transactional
+    public Job cancelJob(UUID jobId) {
+
+        LocalDateTime now =
+                LocalDateTime.now();
+
+        /*
+         * ======================================
+         * STEP 1
+         * ======================================
+         *
+         * Try to cancel PENDING or RETRYING job.
+         */
+
+        int cancelled =
+                jobRepository.cancelPendingOrRetryingJob(
+                        jobId,
+                        JobStatus.PENDING,
+                        JobStatus.RETRYING,
+                        JobStatus.CANCELLED,
+                        now
+                );
+
+        if (cancelled == 1) {
+
+            System.out.println(
+                    "JOB CANCELLED: "
+                            + jobId
+            );
+
+            return jobRepository.findById(
+                    jobId
+            ).orElseThrow();
+        }
+
+        /*
+         * ======================================
+         * STEP 2
+         * ======================================
+         *
+         * If it wasn't PENDING/RETRYING,
+         * check whether it is PROCESSING.
+         */
+
+        Job job =
+                jobRepository.findById(jobId)
+                        .orElseThrow(
+                                () -> new RuntimeException(
+                                        "Job not found: "
+                                                + jobId
+                                )
+                        );
+
+        /*
+         * Only PROCESSING jobs need worker
+         * ownership validation.
+         */
+
+        if (job.getStatus()
+                == JobStatus.PROCESSING) {
+
+            String workerId =
+                    job.getWorkerId();
+
+            if (workerId == null) {
+
+                throw new IllegalStateException(
+                        "Processing job has no worker owner"
+                );
+            }
+
+            int processingCancelled =
+                    jobRepository.cancelProcessingJob(
+                            jobId,
+                            workerId,
+                            JobStatus.PROCESSING,
+                            JobStatus.CANCELLED,
+                            now
+                    );
+
+            if (processingCancelled == 1) {
+
+                System.out.println(
+                        "PROCESSING JOB CANCELLED: "
+                                + jobId
+                );
+
+                return jobRepository.findById(
+                        jobId
+                ).orElseThrow();
+            }
+
+            /*
+             * The worker may have lost the lease
+             * or another state transition happened
+             * concurrently.
+             */
+
+            throw new IllegalStateException(
+                    "Job could not be cancelled because "
+                            + "ownership or lease was lost"
+            );
+        }
+
+        /*
+         * ======================================
+         * OTHER STATES
+         * ======================================
+         */
+
+        if (job.getStatus()
+                == JobStatus.CANCELLED) {
+
+            throw new IllegalStateException(
+                    "Job is already CANCELLED"
+            );
+        }
+
+        if (job.getStatus()
+                == JobStatus.COMPLETED) {
+
+            throw new IllegalStateException(
+                    "Completed job cannot be cancelled"
+            );
+        }
+
+        if (job.getStatus()
+                == JobStatus.DEAD) {
+
+            throw new IllegalStateException(
+                    "DEAD job cannot be cancelled. "
+                            + "Use the reprocess API first."
+            );
+        }
+
+        throw new IllegalStateException(
+                "Job cannot be cancelled. "
+                        + "Current status: "
+                        + job.getStatus()
+        );
     }
 }

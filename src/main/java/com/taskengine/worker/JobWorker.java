@@ -27,16 +27,13 @@ public class JobWorker implements SmartLifecycle {
             new AtomicBoolean(true);
 
     /*
-     * true -> worker currently executing a job
+     * true -> worker is currently executing a job
      */
     private final AtomicBoolean jobRunning =
             new AtomicBoolean(false);
 
     /*
      * Current job being executed.
-     *
-     * JobHeartbeat uses this during graceful
-     * shutdown to keep the lease alive.
      */
     private volatile Job currentJob;
 
@@ -60,8 +57,7 @@ public class JobWorker implements SmartLifecycle {
     public void run() {
 
         /*
-         * Do not accept new jobs after shutdown
-         * begins.
+         * Do not accept new jobs after shutdown.
          */
         if (!running.get()) {
             return;
@@ -78,10 +74,6 @@ public class JobWorker implements SmartLifecycle {
 
     public void processNextJob() {
 
-        /*
-         * Double-check shutdown state before
-         * touching Redis.
-         */
         if (!running.get()) {
             return;
         }
@@ -105,8 +97,6 @@ public class JobWorker implements SmartLifecycle {
 
             /*
              * Redis may be shutting down.
-             *
-             * Do not turn this into a failed job.
              */
             if (!running.get()) {
 
@@ -131,9 +121,11 @@ public class JobWorker implements SmartLifecycle {
         }
 
         /*
-         * We now own a job that was received
-         * from Redis.
+         * ==========================================
+         * JOB RECEIVED
+         * ==========================================
          */
+
         jobRunning.set(true);
 
         System.out.println(
@@ -183,7 +175,31 @@ public class JobWorker implements SmartLifecycle {
         }
 
         /*
-         * Make current job visible to heartbeat.
+         * ==========================================
+         * IMPORTANT:
+         * CHECK CANCELLATION BEFORE CLAIMING
+         * ==========================================
+         *
+         * This protects against a job that was
+         * cancelled while it was sitting in Redis.
+         */
+
+        if (job.getStatus() == JobStatus.CANCELLED) {
+
+            System.out.println(
+                    "SKIPPING CANCELLED JOB: "
+                            + job.getId()
+            );
+
+            currentJob = null;
+
+            jobRunning.set(false);
+
+            return;
+        }
+
+        /*
+         * Make current job visible to shutdown logic.
          */
         currentJob = job;
 
@@ -197,6 +213,42 @@ public class JobWorker implements SmartLifecycle {
 
             LocalDateTime now =
                     LocalDateTime.now();
+
+            /*
+             * Re-check cancellation immediately
+             * before changing state.
+             */
+            Job latestJob =
+                    jobRepository.findById(id)
+                            .orElse(null);
+
+            if (latestJob == null) {
+
+                System.out.println(
+                        "JOB DISAPPEARED BEFORE CLAIM: "
+                                + id
+                );
+
+                return;
+            }
+
+            if (latestJob.getStatus()
+                    == JobStatus.CANCELLED) {
+
+                System.out.println(
+                        "JOB CANCELLED BEFORE CLAIM: "
+                                + id
+                );
+
+                return;
+            }
+
+            /*
+             * Use the latest database entity.
+             */
+            job = latestJob;
+
+            currentJob = job;
 
             job.setStatus(
                     JobStatus.PROCESSING
@@ -264,25 +316,103 @@ public class JobWorker implements SmartLifecycle {
                             + job.getId()
             );
 
-            executeJob(job);
+            boolean cancelled =
+                    executeJob(job);
+
+            /*
+             * ======================================
+             * CANCELLATION DETECTED
+             * ======================================
+             */
+
+            if (cancelled) {
+
+                System.out.println(
+                        "========================================"
+                );
+
+                System.out.println(
+                        "JOB EXECUTION CANCELLED: "
+                                + job.getId()
+                );
+
+                System.out.println(
+                        "WORKER: "
+                                + workerId
+                );
+
+                System.out.println(
+                        "JOB WILL NOT BE COMPLETED"
+                );
+
+                System.out.println(
+                        "========================================"
+                );
+
+                return;
+            }
+
+            /*
+             * ======================================
+             * FINAL CANCELLATION CHECK
+             * ======================================
+             *
+             * The job might have been cancelled
+             * immediately after executeJob() returned.
+             *
+             * Check PostgreSQL one final time before
+             * attempting COMPLETED.
+             */
+
+            Job finalJob =
+                    jobRepository.findById(
+                            job.getId()
+                    ).orElse(null);
+
+            if (finalJob == null) {
+
+                System.out.println(
+                        "JOB NO LONGER EXISTS: "
+                                + job.getId()
+                );
+
+                return;
+            }
+
+            if (finalJob.getStatus()
+                    == JobStatus.CANCELLED) {
+
+                System.out.println(
+                        "========================================"
+                );
+
+                System.out.println(
+                        "CANCELLATION DETECTED "
+                                + "BEFORE COMPLETION"
+                );
+
+                System.out.println(
+                        "JOB: "
+                                + job.getId()
+                );
+
+                System.out.println(
+                        "JOB WILL NOT BE COMPLETED"
+                );
+
+                System.out.println(
+                        "========================================"
+                );
+
+                return;
+            }
 
             /*
              * ======================================
              * COMPLETE JOB
              * ======================================
              *
-             * IMPORTANT:
-             *
-             * Do NOT use:
-             *
-             * job.setStatus(COMPLETED);
-             * jobRepository.save(job);
-             *
-             * because another worker may have
-             * reclaimed this job.
-             *
-             * Instead perform an atomic ownership
-             * check in PostgreSQL.
+             * Atomic ownership + lease check.
              */
 
             LocalDateTime completionTime =
@@ -299,9 +429,6 @@ public class JobWorker implements SmartLifecycle {
 
             if (updated == 1) {
 
-                /*
-                 * We still own the job.
-                 */
                 System.out.println(
                         "COMPLETED JOB: "
                                 + job.getId()
@@ -310,9 +437,10 @@ public class JobWorker implements SmartLifecycle {
             } else {
 
                 /*
-                 * Another worker/reaper changed
-                 * the job before we completed it.
+                 * Another worker/reaper/cancellation
+                 * changed the job.
                  */
+
                 System.out.println(
                         "========================================"
                 );
@@ -333,7 +461,7 @@ public class JobWorker implements SmartLifecycle {
 
                 System.out.println(
                         "The job may have been "
-                                + "reclaimed by another worker."
+                                + "cancelled or reclaimed."
                 );
 
                 System.out.println(
@@ -345,9 +473,23 @@ public class JobWorker implements SmartLifecycle {
 
             /*
              * ======================================
-             * JOB FAILED
+             * FAILURE HANDLING
              * ======================================
              */
+
+            /*
+             * Do not treat cancellation as a normal
+             * retryable failure.
+             */
+            if (isJobCancelled(job)) {
+
+                System.out.println(
+                        "JOB WAS CANCELLED: "
+                                + job.getId()
+                );
+
+                return;
+            }
 
             handleFailure(
                     job,
@@ -356,12 +498,43 @@ public class JobWorker implements SmartLifecycle {
 
         } finally {
 
-            /*
-             * Job execution is finished.
-             */
             currentJob = null;
 
             jobRunning.set(false);
+        }
+    }
+
+    /*
+     * ==========================================
+     * CHECK DATABASE CANCELLATION
+     * ==========================================
+     */
+
+    private boolean isJobCancelled(Job job) {
+
+        try {
+
+            Job latest =
+                    jobRepository.findById(
+                            job.getId()
+                    ).orElse(null);
+
+            return latest != null
+                    && latest.getStatus()
+                    == JobStatus.CANCELLED;
+
+        } catch (Exception e) {
+
+            /*
+             * If the database temporarily fails,
+             * don't incorrectly assume cancellation.
+             */
+            System.out.println(
+                    "CANCELLATION CHECK FAILED: "
+                            + e.getMessage()
+            );
+
+            return false;
         }
     }
 
@@ -377,13 +550,20 @@ public class JobWorker implements SmartLifecycle {
     ) {
 
         /*
-         * If the lease was already lost, don't
-         * blindly overwrite the state that another
-         * worker may have established.
-         *
-         * For now we preserve the existing retry
-         * behavior.
+         * Check cancellation before changing the
+         * job to RETRYING or DEAD.
          */
+
+        if (isJobCancelled(job)) {
+
+            System.out.println(
+                    "JOB CANCELLED - "
+                            + "SKIPPING FAILURE HANDLING: "
+                            + job.getId()
+            );
+
+            return;
+        }
 
         int nextAttempt =
                 job.getAttemptCount() + 1;
@@ -409,15 +589,6 @@ public class JobWorker implements SmartLifecycle {
          */
 
         if (nextAttempt < job.getMaxAttempts()) {
-
-            /*
-             * Exponential backoff:
-             *
-             * attempt 1 -> 2 seconds
-             * attempt 2 -> 4 seconds
-             * attempt 3 -> 8 seconds
-             * attempt 4 -> 16 seconds
-             */
 
             long delaySeconds =
                     (long) Math.pow(
@@ -529,9 +700,14 @@ public class JobWorker implements SmartLifecycle {
      * ==========================================
      * JOB EXECUTION
      * ==========================================
+     *
+     * Returns:
+     *
+     * true  -> job was cancelled
+     * false -> job completed execution normally
      */
 
-    private void executeJob(Job job) {
+    private boolean executeJob(Job job) {
 
         switch (job.getType()) {
 
@@ -542,26 +718,120 @@ public class JobWorker implements SmartLifecycle {
                                 + job.getPayload()
                 );
 
-                try {
+                /*
+                 * 15-second test job.
+                 *
+                 * Instead of one Thread.sleep(15000),
+                 * sleep in 500ms intervals and check
+                 * PostgreSQL for cancellation.
+                 */
+
+                long totalDuration =
+                        15000;
+
+                long checkInterval =
+                        500;
+
+                long elapsed =
+                        0;
+
+                while (elapsed < totalDuration) {
 
                     /*
-                     * 15-second test job.
-                     *
-                     * Keep this for crash/shutdown
-                     * testing.
+                     * ==================================
+                     * CHECK WORKER SHUTDOWN
+                     * ==================================
                      */
-                    Thread.sleep(15000);
 
-                } catch (InterruptedException e) {
+                    if (!running.get()) {
 
-                    Thread.currentThread()
-                            .interrupt();
+                        System.out.println(
+                                "JOB EXECUTION INTERRUPTED "
+                                        + "BY WORKER SHUTDOWN: "
+                                        + job.getId()
+                        );
 
-                    throw new RuntimeException(
-                            "Job interrupted",
-                            e
-                    );
+                        /*
+                         * Do not mark it completed.
+                         *
+                         * Graceful shutdown waits for the
+                         * current job, so normally this
+                         * branch won't occur during a normal
+                         * shutdown.
+                         */
+                        return false;
+                    }
+
+                    /*
+                     * ==================================
+                     * CHECK DATABASE CANCELLATION
+                     * ==================================
+                     */
+
+                    if (isJobCancelled(job)) {
+
+                        System.out.println(
+                                "========================================"
+                        );
+
+                        System.out.println(
+                                "CANCELLATION DETECTED"
+                        );
+
+                        System.out.println(
+                                "JOB: "
+                                        + job.getId()
+                        );
+
+                        System.out.println(
+                                "STOPPING JOB EXECUTION"
+                        );
+
+                        System.out.println(
+                                "========================================"
+                        );
+
+                        return true;
+                    }
+
+                    try {
+
+                        Thread.sleep(
+                                checkInterval
+                        );
+
+                    } catch (InterruptedException e) {
+
+                        Thread.currentThread()
+                                .interrupt();
+
+                        /*
+                         * Check whether the interruption
+                         * happened because the job was
+                         * cancelled.
+                         */
+                        if (isJobCancelled(job)) {
+
+                            System.out.println(
+                                    "JOB CANCELLED "
+                                            + "DURING EXECUTION: "
+                                            + job.getId()
+                            );
+
+                            return true;
+                        }
+
+                        throw new RuntimeException(
+                                "Job interrupted",
+                                e
+                        );
+                    }
+
+                    elapsed +=
+                            checkInterval;
                 }
+
+                return false;
             }
 
             default -> throw new IllegalArgumentException(
@@ -639,7 +909,7 @@ public class JobWorker implements SmartLifecycle {
         );
 
         /*
-         * Stop accepting NEW jobs.
+         * Stop accepting new jobs.
          */
         running.set(false);
 
@@ -649,9 +919,6 @@ public class JobWorker implements SmartLifecycle {
 
         /*
          * Wait for the current job to finish.
-         *
-         * JobHeartbeat continues renewing its
-         * lease while this happens.
          */
         while (jobRunning.get()) {
 
@@ -688,10 +955,6 @@ public class JobWorker implements SmartLifecycle {
                 "========================================"
         );
 
-        /*
-         * Tell Spring lifecycle processing that
-         * this worker has completely stopped.
-         */
         callback.run();
     }
 

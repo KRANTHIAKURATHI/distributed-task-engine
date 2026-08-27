@@ -6,5 +6,6 @@ public enum JobStatus {
     COMPLETED,
     FAILED,
     RETRYING,
-    DEAD
+    DEAD,
+    CANCELLED
 }

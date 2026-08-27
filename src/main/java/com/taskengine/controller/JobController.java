@@ -24,6 +24,8 @@ public class JobController {
      * ==========================================
      * CREATE JOB
      * ==========================================
+     *
+     * POST /api/v1/jobs
      */
 
     @PostMapping
@@ -65,6 +67,24 @@ public class JobController {
     ) {
 
         return jobService.reprocessJob(
+                id
+        );
+    }
+
+    /*
+     * ==========================================
+     * CANCEL JOB
+     * ==========================================
+     *
+     * POST /api/v1/jobs/{id}/cancel
+     */
+
+    @PostMapping("/{id}/cancel")
+    public Job cancelJob(
+            @PathVariable UUID id
+    ) {
+
+        return jobService.cancelJob(
                 id
         );
     }

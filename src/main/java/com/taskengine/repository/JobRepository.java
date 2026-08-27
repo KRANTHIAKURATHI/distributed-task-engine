@@ -133,4 +133,73 @@ public interface JobRepository
             @Param("completedStatus") JobStatus completedStatus,
             @Param("now") LocalDateTime now
     );
+    /*
+     * ==========================================
+     * CANCEL JOB
+     * ==========================================
+     *
+     * Cancels a job only when it is currently
+     * PENDING or RETRYING.
+     *
+     * Returns:
+     * 1 -> job cancelled
+     * 0 -> job was not cancellable
+     */
+    @Modifying
+    @Transactional
+    @Query("""
+        UPDATE Job j
+        SET j.status = :cancelledStatus,
+            j.workerId = null,
+            j.claimedAt = null,
+            j.leaseUntil = null,
+            j.updatedAt = :now
+        WHERE j.id = :id
+          AND (
+              j.status = :pendingStatus
+              OR j.status = :retryingStatus
+          )
+    """)
+    int cancelPendingOrRetryingJob(
+            @Param("id") UUID id,
+            @Param("pendingStatus") JobStatus pendingStatus,
+            @Param("retryingStatus") JobStatus retryingStatus,
+            @Param("cancelledStatus") JobStatus cancelledStatus,
+            @Param("now") LocalDateTime now
+    );
+
+    /*
+     * ==========================================
+     * CANCEL PROCESSING JOB
+     * ==========================================
+     *
+     * Cancels a currently processing job only
+     * if the specified worker still owns it and
+     * the lease is still valid.
+     *
+     * Returns:
+     * 1 -> cancellation succeeded
+     * 0 -> ownership/lease was already lost
+     */
+    @Modifying
+    @Transactional
+    @Query("""
+        UPDATE Job j
+        SET j.status = :cancelledStatus,
+            j.workerId = null,
+            j.claimedAt = null,
+            j.leaseUntil = null,
+            j.updatedAt = :now
+        WHERE j.id = :id
+          AND j.workerId = :workerId
+          AND j.status = :processingStatus
+          AND j.leaseUntil > :now
+    """)
+    int cancelProcessingJob(
+            @Param("id") UUID id,
+            @Param("workerId") String workerId,
+            @Param("processingStatus") JobStatus processingStatus,
+            @Param("cancelledStatus") JobStatus cancelledStatus,
+            @Param("now") LocalDateTime now
+    );
 }
