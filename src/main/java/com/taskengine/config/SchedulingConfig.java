@@ -16,12 +16,18 @@ public class SchedulingConfig {
                 new ThreadPoolTaskScheduler();
 
         scheduler.setPoolSize(4);
+
         scheduler.setThreadNamePrefix(
                 "task-engine-scheduler-"
         );
 
-        scheduler.setWaitForTasksToCompleteOnShutdown(true);
-        scheduler.setAwaitTerminationSeconds(10);
+        scheduler.setWaitForTasksToCompleteOnShutdown(
+                true
+        );
+
+        scheduler.setAwaitTerminationSeconds(
+                10
+        );
 
         return scheduler;
     }

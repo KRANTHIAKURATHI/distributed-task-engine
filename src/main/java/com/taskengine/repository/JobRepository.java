@@ -1,7 +1,9 @@
 package com.taskengine.repository;
-
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import com.taskengine.entity.Job;
 import com.taskengine.enums.JobStatus;
+
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -53,15 +55,89 @@ public interface JobRepository
 
     /*
      * ==========================================
-     * FIND DEAD JOBS / DLQ
+     * FIND JOBS BY STATUS
      * ==========================================
      *
-     * Used by:
+     * Used by DLQ inspection.
+     */
+    /*
+     * ==========================================
+     * FIND JOBS BY STATUS
+     * ==========================================
      *
-     * GET /api/v1/jobs/dlq
+     * Used by DLQ inspection.
      */
     List<Job> findByStatus(
             JobStatus status
+    );
+
+    /*
+     * ==========================================
+     * FIND JOBS BY STATUS WITH PAGINATION
+     * ==========================================
+     *
+     * Used by Job Listing API.
+     */
+    Page<Job> findJobsByStatus(
+            JobStatus status,
+            Pageable pageable
+    );
+
+    /*
+     * ==========================================
+     * FIND PENDING JOBS BY PRIORITY
+     * ==========================================
+     *
+     * Used by PriorityScheduler.
+     *
+     * Higher priority first.
+     *
+     * Same priority:
+     * older jobs first.
+     */
+    List<Job> findByStatusOrderByPriorityDescCreatedAtAsc(
+            JobStatus status
+    );
+
+    /*
+     * ==========================================
+     * FIND STUCK DISPATCHED JOBS
+     * ==========================================
+     *
+     * Used by DispatchedJobRecovery.
+     */
+    List<Job> findByStatusAndUpdatedAtBefore(
+            JobStatus status,
+            LocalDateTime time
+    );
+
+    /*
+     * ==========================================
+     * DISPATCH JOB ATOMICALLY
+     * ==========================================
+     *
+     * PENDING → DISPATCHED
+     *
+     * Only one scheduler instance can
+     * successfully dispatch a job.
+     */
+    @Modifying(
+            flushAutomatically = true,
+            clearAutomatically = true
+    )
+    @Transactional
+    @Query("""
+        UPDATE Job j
+        SET j.status = :dispatchedStatus,
+            j.updatedAt = :now
+        WHERE j.id = :id
+          AND j.status = :pendingStatus
+    """)
+    int dispatchJob(
+            @Param("id") UUID id,
+            @Param("pendingStatus") JobStatus pendingStatus,
+            @Param("dispatchedStatus") JobStatus dispatchedStatus,
+            @Param("now") LocalDateTime now
     );
 
     /*
@@ -98,19 +174,12 @@ public interface JobRepository
      * COMPLETE JOB IF STILL OWNED
      * ==========================================
      *
-     * This prevents an old worker from completing
-     * a job after its lease has been lost and the
-     * job has been reclaimed by another worker.
-     *
-     * Completion succeeds ONLY when:
+     * Completion succeeds only when:
      *
      * 1. Job ID matches
      * 2. Worker ID still matches
-     * 3. Job is still PROCESSING
+     * 3. Job is PROCESSING
      * 4. Lease has not expired
-     *
-     * If another worker has already reclaimed the
-     * job, this UPDATE affects 0 rows.
      */
     @Modifying
     @Transactional
@@ -133,17 +202,14 @@ public interface JobRepository
             @Param("completedStatus") JobStatus completedStatus,
             @Param("now") LocalDateTime now
     );
+
     /*
      * ==========================================
-     * CANCEL JOB
+     * CANCEL PENDING / RETRYING JOB
      * ==========================================
      *
-     * Cancels a job only when it is currently
-     * PENDING or RETRYING.
-     *
-     * Returns:
-     * 1 -> job cancelled
-     * 0 -> job was not cancellable
+     * PENDING   → CANCELLED
+     * RETRYING  → CANCELLED
      */
     @Modifying
     @Transactional
@@ -173,13 +239,12 @@ public interface JobRepository
      * CANCEL PROCESSING JOB
      * ==========================================
      *
-     * Cancels a currently processing job only
-     * if the specified worker still owns it and
-     * the lease is still valid.
+     * PROCESSING → CANCELLED
      *
-     * Returns:
-     * 1 -> cancellation succeeded
-     * 0 -> ownership/lease was already lost
+     * Only the worker that currently owns the
+     * job can cancel it.
+     *
+     * The lease must still be valid.
      */
     @Modifying
     @Transactional
@@ -203,3 +268,4 @@ public interface JobRepository
             @Param("now") LocalDateTime now
     );
 }
+

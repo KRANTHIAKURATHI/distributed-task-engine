@@ -4,11 +4,12 @@ import com.taskengine.entity.Job;
 import org.springframework.data.redis.connection.stream.Consumer;
 import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.connection.stream.ReadOffset;
+import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.connection.stream.StreamOffset;
 import org.springframework.data.redis.connection.stream.StreamReadOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
-
+import org.springframework.data.domain.Range;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -25,9 +26,12 @@ public class JobQueue {
 
     private final StringRedisTemplate redisTemplate;
 
-    public JobQueue(StringRedisTemplate redisTemplate) {
+    public JobQueue(
+            StringRedisTemplate redisTemplate
+    ) {
 
-        this.redisTemplate = redisTemplate;
+        this.redisTemplate =
+                redisTemplate;
 
         createConsumerGroup();
     }
@@ -37,6 +41,7 @@ public class JobQueue {
      * ADD JOB TO REDIS STREAM
      * ==========================================
      */
+
     public void enqueue(UUID jobId) {
 
         Map<String, String> message =
@@ -45,15 +50,22 @@ public class JobQueue {
                         jobId.toString()
                 );
 
-        redisTemplate.opsForStream()
-                .add(
-                        JOB_STREAM,
-                        message
-                );
+        RecordId recordId =
+                redisTemplate
+                        .opsForStream()
+                        .add(
+                                JOB_STREAM,
+                                message
+                        );
 
         System.out.println(
                 "JOB ADDED TO REDIS STREAM: "
                         + jobId
+        );
+
+        System.out.println(
+                "REDIS RECORD ID: "
+                        + recordId
         );
     }
 
@@ -62,11 +74,13 @@ public class JobQueue {
      * CREATE CONSUMER GROUP
      * ==========================================
      */
+
     private void createConsumerGroup() {
 
         try {
 
-            redisTemplate.opsForStream()
+            redisTemplate
+                    .opsForStream()
                     .createGroup(
                             JOB_STREAM,
                             ReadOffset.from("0-0"),
@@ -81,7 +95,7 @@ public class JobQueue {
         } catch (Exception e) {
 
             /*
-             * Group already exists.
+             * Usually means the group already exists.
              */
             System.out.println(
                     "REDIS CONSUMER GROUP ALREADY EXISTS"
@@ -91,17 +105,230 @@ public class JobQueue {
 
     /*
      * ==========================================
+     * RECOVER PENDING JOBS
+     * ==========================================
+     *
+     * Uses Redis XAUTOCLAIM.
+     *
+     * Finds messages that have been pending for
+     * longer than the configured idle time and
+     * transfers ownership to the current worker.
+     */
+    public List<ClaimedJob> recoverPendingJobs(
+            String workerId,
+            long minIdleTimeMs
+    ) {
+
+        Consumer consumer =
+                Consumer.from(
+                        CONSUMER_GROUP,
+                        workerId
+                );
+
+        /*
+         * Find pending messages that have been idle
+         * longer than the configured threshold.
+         *
+         * Start from the beginning of the PEL.
+         */
+        var pendingMessages =
+                redisTemplate
+                        .opsForStream()
+                        .pending(
+                                JOB_STREAM,
+                                CONSUMER_GROUP,
+                                Range.unbounded(),
+                                10
+                        );
+
+        if (pendingMessages == null
+                || pendingMessages.isEmpty()) {
+
+            return List.of();
+        }
+
+        /*
+         * Collect Redis record IDs that are old enough
+         * to be recovered.
+         */
+        List<RecordId> recordIds =
+                new java.util.ArrayList<>();
+
+        for (var pendingMessage :
+                pendingMessages) {
+
+            if (pendingMessage
+                    .getElapsedTimeSinceLastDelivery()
+                    .toMillis()
+                    >= minIdleTimeMs) {
+
+                recordIds.add(
+                        pendingMessage
+                                .getId()
+                );
+            }
+        }
+
+        if (recordIds.isEmpty()) {
+
+            return List.of();
+        }
+
+        /*
+         * ==========================================
+         * CLAIM OWNERSHIP
+         * ==========================================
+         *
+         * Transfer ownership of stale messages from
+         * the failed/old consumer to this worker.
+         */
+        List<MapRecord<String, Object, Object>>
+                claimedRecords =
+                redisTemplate
+                        .opsForStream()
+                        .claim(
+                                JOB_STREAM,
+                                CONSUMER_GROUP,
+                                workerId,
+                                Duration.ofMillis(
+                                        minIdleTimeMs
+                                ),
+                                recordIds.toArray(
+                                        new RecordId[0]
+                                )
+                        );
+
+        if (claimedRecords == null
+                || claimedRecords.isEmpty()) {
+
+            return List.of();
+        }
+
+        List<ClaimedJob> recoveredJobs =
+                new java.util.ArrayList<>();
+
+        /*
+         * ==========================================
+         * CONVERT REDIS RECORDS
+         * ==========================================
+         */
+        for (MapRecord<String, Object, Object> record :
+                claimedRecords) {
+
+            Object jobId =
+                    record
+                            .getValue()
+                            .get("jobId");
+
+            if (jobId == null) {
+
+                System.out.println(
+                        "RECOVERED REDIS MESSAGE "
+                                + "HAS NO jobId: "
+                                + record.getId()
+                );
+
+                continue;
+            }
+
+            String recordId =
+                    record.getId().getValue();
+
+            System.out.println(
+                    "========================================"
+            );
+
+            System.out.println(
+                    "REDIS JOB RECOVERED"
+            );
+
+            System.out.println(
+                    "Worker: "
+                            + workerId
+            );
+
+            System.out.println(
+                    "Redis Record: "
+                            + recordId
+            );
+
+            System.out.println(
+                    "Job ID: "
+                            + jobId
+            );
+
+            System.out.println(
+                    "========================================"
+            );
+
+            recoveredJobs.add(
+                    new ClaimedJob(
+                            jobId.toString(),
+                            recordId
+                    )
+            );
+        }
+
+        return recoveredJobs;
+    }
+
+    /*
+     * ==========================================
+     * CLAIMED JOB
+     * ==========================================
+     *
+     * Contains BOTH:
+     *
+     * 1. Database Job ID
+     * 2. Redis Stream Record ID
+     *
+     * We need the Redis Record ID later for XACK.
+     */
+
+    public static class ClaimedJob {
+
+        private final String jobId;
+        private final String recordId;
+
+        public ClaimedJob(
+                String jobId,
+                String recordId
+        ) {
+
+            this.jobId = jobId;
+            this.recordId = recordId;
+        }
+
+        public String getJobId() {
+
+            return jobId;
+        }
+
+        public String getRecordId() {
+
+            return recordId;
+        }
+    }
+
+    /*
+     * ==========================================
      * CLAIM JOB
      * ==========================================
      *
-     * IMPORTANT:
+     * Consumer-group read.
      *
-     * This is a BLOCKING READ.
+     * lastConsumed() allows the consumer group
+     * to continue from its last delivered position.
      *
-     * The worker waits for a new Redis Stream
-     * message instead of repeatedly polling.
+     * The Redis record is NOT acknowledged here.
+     *
+     * It remains pending until the worker
+     * successfully finishes processing.
      */
-    public String claimJob(String workerId) {
+
+    public ClaimedJob claimJob(
+            String workerId
+    ) {
 
         Consumer consumer =
                 Consumer.from(
@@ -112,7 +339,9 @@ public class JobQueue {
         StreamReadOptions options =
                 StreamReadOptions.empty()
                         .count(1)
-                        .block(Duration.ofSeconds(5));
+                        .block(
+                                Duration.ofSeconds(5)
+                        );
 
         StreamOffset<String> offset =
                 StreamOffset.create(
@@ -120,24 +349,29 @@ public class JobQueue {
                         ReadOffset.lastConsumed()
                 );
 
-        List<MapRecord<String, Object, Object>> records =
-                redisTemplate.opsForStream()
+        List<MapRecord<String, Object, Object>>
+                records =
+                redisTemplate
+                        .opsForStream()
                         .read(
                                 consumer,
                                 options,
                                 offset
                         );
 
-        if (records == null || records.isEmpty()) {
+        if (records == null
+                || records.isEmpty()) {
 
             return null;
         }
 
-        MapRecord<String, Object, Object> record =
+        MapRecord<String, Object, Object>
+                record =
                 records.get(0);
 
         Object jobId =
-                record.getValue()
+                record
+                        .getValue()
                         .get("jobId");
 
         if (jobId == null) {
@@ -148,6 +382,9 @@ public class JobQueue {
 
             return null;
         }
+
+        String recordId =
+                record.getId().getValue();
 
         System.out.println(
                 "========================================"
@@ -164,7 +401,7 @@ public class JobQueue {
 
         System.out.println(
                 "Redis Record: "
-                        + record.getId()
+                        + recordId
         );
 
         System.out.println(
@@ -176,7 +413,59 @@ public class JobQueue {
                 "========================================"
         );
 
-        return jobId.toString();
+        return new ClaimedJob(
+                jobId.toString(),
+                recordId
+        );
+    }
+
+    /*
+     * ==========================================
+     * ACKNOWLEDGE JOB
+     * ==========================================
+     *
+     * Removes the Redis Stream record from
+     * the consumer group's Pending Entries List.
+     *
+     * IMPORTANT:
+     *
+     * Call this ONLY after the database job has
+     * been successfully handled.
+     */
+
+    public boolean acknowledge(
+            String recordId
+    ) {
+
+        Long acknowledged =
+                redisTemplate
+                        .opsForStream()
+                        .acknowledge(
+                                JOB_STREAM,
+                                CONSUMER_GROUP,
+                                recordId
+                        );
+
+        boolean success =
+                acknowledged != null
+                        && acknowledged == 1;
+
+        if (success) {
+
+            System.out.println(
+                    "REDIS JOB ACKNOWLEDGED: "
+                            + recordId
+            );
+
+        } else {
+
+            System.out.println(
+                    "REDIS ACK FAILED: "
+                            + recordId
+            );
+        }
+
+        return success;
     }
 
     /*
@@ -184,9 +473,12 @@ public class JobQueue {
      * REQUEUE JOB
      * ==========================================
      */
+
     public void enqueueJob(Job job) {
 
-        enqueue(job.getId());
+        enqueue(
+                job.getId()
+        );
 
         System.out.println(
                 "JOB REQUEUED TO REDIS: "

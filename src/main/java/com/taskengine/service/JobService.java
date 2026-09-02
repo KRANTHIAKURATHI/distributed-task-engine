@@ -5,6 +5,10 @@ import com.taskengine.entity.Job;
 import com.taskengine.enums.JobStatus;
 import com.taskengine.queue.JobQueue;
 import com.taskengine.repository.JobRepository;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -30,28 +34,85 @@ public class JobService {
      * ==========================================
      * CREATE JOB
      * ==========================================
+     *
+     * The job is saved to PostgreSQL first.
+     *
+     * PriorityScheduler will dispatch the job
+     * to Redis.
      */
-
-    public Job createJob(CreateJobRequest request) {
+    public Job createJob(
+            CreateJobRequest request
+    ) {
 
         Job job = new Job();
 
-        job.setType(request.getType());
-        job.setPayload(request.getPayload());
-        job.setPriority(request.getPriority());
-        job.setScheduledAt(request.getScheduledAt());
-        job.setMaxAttempts(request.getMaxAttempts());
+        job.setType(
+                request.getType()
+        );
 
-        job.setStatus(JobStatus.PENDING);
-        job.setAttemptCount(0);
-        job.setCreatedAt(LocalDateTime.now());
-        job.setUpdatedAt(LocalDateTime.now());
+        job.setPayload(
+                request.getPayload()
+        );
 
+        job.setPriority(
+                request.getPriority()
+        );
+
+        job.setScheduledAt(
+                request.getScheduledAt()
+        );
+
+        job.setMaxAttempts(
+                request.getMaxAttempts()
+        );
+
+        job.setStatus(
+                JobStatus.PENDING
+        );
+
+        job.setAttemptCount(
+                0
+        );
+
+        job.setCreatedAt(
+                LocalDateTime.now()
+        );
+
+        job.setUpdatedAt(
+                LocalDateTime.now()
+        );
+
+        /*
+         * Save to PostgreSQL.
+         */
         Job savedJob =
                 jobRepository.save(job);
 
-        jobQueue.enqueue(
-                savedJob.getId()
+        System.out.println(
+                "========================================"
+        );
+
+        System.out.println(
+                "JOB CREATED: "
+                        + savedJob.getId()
+        );
+
+        System.out.println(
+                "PRIORITY: "
+                        + savedJob.getPriority()
+        );
+
+        System.out.println(
+                "STATUS: "
+                        + savedJob.getStatus()
+        );
+
+        System.out.println(
+                "WAITING FOR PRIORITY SCHEDULER"
+        );
+
+        System.out.println(
+                "========================================"
         );
 
         return savedJob;
@@ -59,10 +120,130 @@ public class JobService {
 
     /*
      * ==========================================
+     * GET JOB BY ID
+     * ==========================================
+     *
+     * GET /api/v1/jobs/{id}
+     */
+    public Job getJobById(
+            UUID jobId
+    ) {
+
+        return jobRepository
+                .findById(jobId)
+                .orElseThrow(
+                        () -> new RuntimeException(
+                                "Job not found: "
+                                        + jobId
+                        )
+                );
+    }
+
+    /*
+     * ==========================================
+     * GET JOBS
+     * ==========================================
+     *
+     * Supports:
+     *
+     * GET /api/v1/jobs
+     *
+     * GET /api/v1/jobs?page=0&size=10
+     *
+     * GET /api/v1/jobs?status=COMPLETED
+     *
+     * GET /api/v1/jobs?status=DEAD&page=0&size=5
+     *
+     * Jobs are sorted by newest first.
+     */
+    public Page<Job> getJobs(
+            JobStatus status,
+            int page,
+            int size
+    ) {
+
+        /*
+         * ======================================
+         * VALIDATE PAGE
+         * ======================================
+         */
+
+        if (page < 0) {
+
+            throw new IllegalArgumentException(
+                    "Page number cannot be negative"
+            );
+        }
+
+        /*
+         * ======================================
+         * VALIDATE SIZE
+         * ======================================
+         */
+
+        if (size < 1 || size > 100) {
+
+            throw new IllegalArgumentException(
+                    "Page size must be between 1 and 100"
+            );
+        }
+
+        /*
+         * ======================================
+         * CREATE PAGINATION
+         * ======================================
+         *
+         * Newest jobs first.
+         */
+        Pageable pageable =
+                PageRequest.of(
+                        page,
+                        size,
+                        Sort.by(
+                                Sort.Direction.DESC,
+                                "createdAt"
+                        )
+                );
+
+        /*
+         * ======================================
+         * STATUS FILTER
+         * ======================================
+         *
+         * If status is supplied:
+         *
+         * SELECT jobs WHERE status = ?
+         *
+         * Otherwise:
+         *
+         * SELECT all jobs.
+         */
+        if (status != null) {
+
+            return jobRepository.findJobsByStatus(
+                    status,
+                    pageable
+            );
+        }
+
+        /*
+         * ======================================
+         * ALL JOBS
+         * ======================================
+         */
+
+        return jobRepository.findAll(
+                pageable
+        );
+    }
+
+    /*
+     * ==========================================
      * DLQ INSPECTION
      * ==========================================
+     *
+     * Returns all DEAD jobs.
      */
-
     public List<Job> getDeadJobs() {
 
         return jobRepository.findByStatus(
@@ -77,9 +258,10 @@ public class JobService {
      *
      * DEAD → PENDING
      */
-
     @Transactional
-    public Job reprocessJob(UUID jobId) {
+    public Job reprocessJob(
+            UUID jobId
+    ) {
 
         Job job =
                 jobRepository.findById(jobId)
@@ -93,8 +275,8 @@ public class JobService {
         /*
          * Only DEAD jobs can be reprocessed.
          */
-
-        if (job.getStatus() != JobStatus.DEAD) {
+        if (job.getStatus()
+                != JobStatus.DEAD) {
 
             throw new IllegalStateException(
                     "Only DEAD jobs can be reprocessed. "
@@ -113,15 +295,25 @@ public class JobService {
                 JobStatus.PENDING
         );
 
-        job.setAttemptCount(0);
+        job.setAttemptCount(
+                0
+        );
 
-        job.setWorkerId(null);
+        job.setWorkerId(
+                null
+        );
 
-        job.setClaimedAt(null);
+        job.setClaimedAt(
+                null
+        );
 
-        job.setLeaseUntil(null);
+        job.setLeaseUntil(
+                null
+        );
 
-        job.setLastError(null);
+        job.setLastError(
+                null
+        );
 
         job.setScheduledAt(
                 LocalDateTime.now()
@@ -132,19 +324,12 @@ public class JobService {
         );
 
         /*
-         * Save PostgreSQL first.
+         * Save PostgreSQL.
+         *
+         * PriorityScheduler will dispatch it.
          */
-
         Job savedJob =
                 jobRepository.save(job);
-
-        /*
-         * Put the job back into Redis.
-         */
-
-        jobQueue.enqueue(
-                savedJob.getId()
-        );
 
         System.out.println(
                 "========================================"
@@ -166,7 +351,7 @@ public class JobService {
         );
 
         System.out.println(
-                "JOB REQUEUED TO REDIS"
+                "WAITING FOR PRIORITY SCHEDULER"
         );
 
         System.out.println(
@@ -181,9 +366,10 @@ public class JobService {
      * CANCEL JOB
      * ==========================================
      */
-
     @Transactional
-    public Job cancelJob(UUID jobId) {
+    public Job cancelJob(
+            UUID jobId
+    ) {
 
         LocalDateTime now =
                 LocalDateTime.now();
@@ -193,9 +379,8 @@ public class JobService {
          * STEP 1
          * ======================================
          *
-         * Try to cancel PENDING or RETRYING job.
+         * Try to cancel PENDING or RETRYING.
          */
-
         int cancelled =
                 jobRepository.cancelPendingOrRetryingJob(
                         jobId,
@@ -222,10 +407,8 @@ public class JobService {
          * STEP 2
          * ======================================
          *
-         * If it wasn't PENDING/RETRYING,
-         * check whether it is PROCESSING.
+         * Check PROCESSING.
          */
-
         Job job =
                 jobRepository.findById(jobId)
                         .orElseThrow(
@@ -236,10 +419,10 @@ public class JobService {
                         );
 
         /*
-         * Only PROCESSING jobs need worker
-         * ownership validation.
+         * ======================================
+         * PROCESSING JOB
+         * ======================================
          */
-
         if (job.getStatus()
                 == JobStatus.PROCESSING) {
 
@@ -273,12 +456,6 @@ public class JobService {
                         jobId
                 ).orElseThrow();
             }
-
-            /*
-             * The worker may have lost the lease
-             * or another state transition happened
-             * concurrently.
-             */
 
             throw new IllegalStateException(
                     "Job could not be cancelled because "
@@ -324,3 +501,4 @@ public class JobService {
         );
     }
 }
+

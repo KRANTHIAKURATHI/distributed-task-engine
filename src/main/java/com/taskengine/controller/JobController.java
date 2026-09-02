@@ -2,8 +2,10 @@ package com.taskengine.controller;
 
 import com.taskengine.dto.CreateJobRequest;
 import com.taskengine.entity.Job;
+import com.taskengine.enums.JobStatus;
 import com.taskengine.service.JobService;
 import jakarta.validation.Valid;
+import org.springframework.data.domain.Page;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
 
@@ -16,8 +18,12 @@ public class JobController {
 
     private final JobService jobService;
 
-    public JobController(JobService jobService) {
-        this.jobService = jobService;
+    public JobController(
+            JobService jobService
+    ) {
+
+        this.jobService =
+                jobService;
     }
 
     /*
@@ -36,6 +42,75 @@ public class JobController {
 
         return jobService.createJob(
                 request
+        );
+    }
+
+    /*
+     * ==========================================
+     * GET ALL JOBS
+     * ==========================================
+     *
+     * GET /api/v1/jobs
+     *
+     * Optional parameters:
+     *
+     * status
+     * page
+     * size
+     *
+     * Examples:
+     *
+     * GET /api/v1/jobs
+     *
+     * GET /api/v1/jobs?page=0&size=10
+     *
+     * GET /api/v1/jobs?status=COMPLETED
+     *
+     * GET /api/v1/jobs?status=DEAD&page=0&size=5
+     */
+
+    @GetMapping
+    public Page<Job> getJobs(
+
+            @RequestParam(
+                    required = false
+            )
+            JobStatus status,
+
+            @RequestParam(
+                    defaultValue = "0"
+            )
+            int page,
+
+            @RequestParam(
+                    defaultValue = "10"
+            )
+            int size
+
+    ) {
+
+        return jobService.getJobs(
+                status,
+                page,
+                size
+        );
+    }
+
+    /*
+     * ==========================================
+     * GET JOB BY ID
+     * ==========================================
+     *
+     * GET /api/v1/jobs/{id}
+     */
+
+    @GetMapping("/{id}")
+    public Job getJobById(
+            @PathVariable UUID id
+    ) {
+
+        return jobService.getJobById(
+                id
         );
     }
 
