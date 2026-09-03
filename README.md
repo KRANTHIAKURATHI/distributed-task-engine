@@ -579,4 +579,4 @@ The goal of this project is to explore how reliable background-job processing sy
 
 ## License
 
-This project is intended for educational and portfolio purposes.
+This project is intended for educational and personal project purposes.
