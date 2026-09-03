@@ -4,6 +4,7 @@ import com.taskengine.entity.Job;
 import com.taskengine.enums.JobStatus;
 import com.taskengine.queue.JobQueue;
 import com.taskengine.repository.JobRepository;
+import com.taskengine.service.IdempotencyService;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -18,6 +19,7 @@ public class JobWorker implements SmartLifecycle {
     private final WorkerIdentity workerIdentity;
     private final JobQueue jobQueue;
     private final JobRepository jobRepository;
+    private final IdempotencyService idempotencyService;
 
     /*
      * true  -> worker accepts new jobs
@@ -35,19 +37,29 @@ public class JobWorker implements SmartLifecycle {
     /*
      * Current job being executed.
      *
-     * JobHeartbeat uses this to renew the
-     * database lease.
+     * JobHeartbeat uses this to renew
+     * the database lease.
      */
     private volatile Job currentJob;
 
     public JobWorker(
             WorkerIdentity workerIdentity,
             JobQueue jobQueue,
-            JobRepository jobRepository
+            JobRepository jobRepository,
+            IdempotencyService idempotencyService
     ) {
-        this.workerIdentity = workerIdentity;
-        this.jobQueue = jobQueue;
-        this.jobRepository = jobRepository;
+
+        this.workerIdentity =
+                workerIdentity;
+
+        this.jobQueue =
+                jobQueue;
+
+        this.jobRepository =
+                jobRepository;
+
+        this.idempotencyService =
+                idempotencyService;
     }
 
     /*
@@ -59,9 +71,6 @@ public class JobWorker implements SmartLifecycle {
     @Scheduled(fixedDelay = 1000)
     public void run() {
 
-        /*
-         * Do not accept new jobs after shutdown.
-         */
         if (!running.get()) {
             return;
         }
@@ -73,14 +82,6 @@ public class JobWorker implements SmartLifecycle {
      * ==========================================
      * PROCESS NEXT NEW JOB
      * ==========================================
-     *
-     * Normal Redis path:
-     *
-     * XREADGROUP
-     *     ↓
-     * ClaimedJob
-     *     ↓
-     * processClaimedJob()
      */
 
     public void processNextJob() {
@@ -108,9 +109,6 @@ public class JobWorker implements SmartLifecycle {
 
         } catch (Exception e) {
 
-            /*
-             * Redis may be shutting down.
-             */
             if (!running.get()) {
 
                 System.out.println(
@@ -143,14 +141,11 @@ public class JobWorker implements SmartLifecycle {
      * PROCESS CLAIMED JOB
      * ==========================================
      *
-     * This method is used by BOTH:
+     * Used by:
      *
-     * 1. Normal XREADGROUP jobs
+     * 1. Normal Redis XREADGROUP
      *
-     * 2. Recovered XCLAIM jobs
-     *
-     * The recovered flag tells us whether the
-     * PostgreSQL job should already be PROCESSING.
+     * 2. PendingJobRecovery / XCLAIM
      */
 
     public void processClaimedJob(
@@ -165,12 +160,6 @@ public class JobWorker implements SmartLifecycle {
 
         String redisRecordId =
                 claimedJob.getRecordId();
-
-        /*
-         * ==========================================
-         * REDIS INFORMATION
-         * ==========================================
-         */
 
         System.out.println(
                 "========================================"
@@ -217,9 +206,6 @@ public class JobWorker implements SmartLifecycle {
                             + jobId
             );
 
-            /*
-             * This message cannot be processed.
-             */
             jobQueue.acknowledge(
                     redisRecordId
             );
@@ -231,7 +217,7 @@ public class JobWorker implements SmartLifecycle {
 
         /*
          * ==========================================
-         * LOAD JOB FROM POSTGRESQL
+         * LOAD JOB
          * ==========================================
          */
 
@@ -246,9 +232,6 @@ public class JobWorker implements SmartLifecycle {
                             + jobId
             );
 
-            /*
-             * Orphan Redis message.
-             */
             jobQueue.acknowledge(
                     redisRecordId
             );
@@ -272,9 +255,6 @@ public class JobWorker implements SmartLifecycle {
                             + job.getId()
             );
 
-            /*
-             * No processing is required.
-             */
             jobQueue.acknowledge(
                     redisRecordId
             );
@@ -283,12 +263,6 @@ public class JobWorker implements SmartLifecycle {
 
             return;
         }
-
-        /*
-         * ==========================================
-         * CURRENT JOB
-         * ==========================================
-         */
 
         currentJob = job;
 
@@ -320,7 +294,7 @@ public class JobWorker implements SmartLifecycle {
 
             /*
              * ======================================
-             * CHECK CANCELLATION
+             * CANCELLATION CHECK
              * ======================================
              */
 
@@ -341,16 +315,8 @@ public class JobWorker implements SmartLifecycle {
 
             /*
              * ======================================
-             * DETERMINE JOB TYPE
+             * DETERMINE DATABASE STATE
              * ======================================
-             *
-             * NORMAL:
-             *
-             * PENDING / DISPATCHED
-             *
-             * RECOVERED:
-             *
-             * PROCESSING + expired lease
              */
 
             boolean normalJob =
@@ -375,14 +341,12 @@ public class JobWorker implements SmartLifecycle {
                 job =
                         latestJob;
 
-                currentJob = job;
+                currentJob =
+                        job;
 
                 LocalDateTime now =
                         LocalDateTime.now();
 
-                /*
-                 * Claim the job in PostgreSQL.
-                 */
                 job.setStatus(
                         JobStatus.PROCESSING
                 );
@@ -396,7 +360,7 @@ public class JobWorker implements SmartLifecycle {
                 );
 
                 /*
-                 * 30-second database lease.
+                 * 30-second lease.
                  */
                 job.setLeaseUntil(
                         now.plusSeconds(30)
@@ -406,7 +370,9 @@ public class JobWorker implements SmartLifecycle {
                         now
                 );
 
-                jobRepository.save(job);
+                jobRepository.save(
+                        job
+                );
 
                 System.out.println(
                         "========================================"
@@ -448,14 +414,10 @@ public class JobWorker implements SmartLifecycle {
              * RECOVERED JOB
              * ======================================
              *
-             * The Redis message was reclaimed using
-             * XCLAIM.
+             * Redis XCLAIM transferred ownership.
              *
-             * The PostgreSQL job should therefore
-             * already be PROCESSING.
-             *
-             * Only recover it if its database lease
-             * has expired.
+             * The PostgreSQL job should already be
+             * PROCESSING.
              */
 
             else if (recoveredJob) {
@@ -464,10 +426,9 @@ public class JobWorker implements SmartLifecycle {
                         LocalDateTime.now();
 
                 /*
-                 * Safety check:
+                 * Another worker may still own this job.
                  *
-                 * Do NOT steal a job from a worker
-                 * whose PostgreSQL lease is still valid.
+                 * Never steal a valid lease.
                  */
                 if (latestJob.getLeaseUntil() != null
                         && latestJob
@@ -483,7 +444,7 @@ public class JobWorker implements SmartLifecycle {
                     );
 
                     System.out.println(
-                            "JOB STILL HAS VALID DATABASE LEASE"
+                            "JOB STILL HAS VALID LEASE"
                     );
 
                     System.out.println(
@@ -492,9 +453,13 @@ public class JobWorker implements SmartLifecycle {
                     );
 
                     System.out.println(
+                            "CURRENT WORKER: "
+                                    + latestJob.getWorkerId()
+                    );
+
+                    System.out.println(
                             "LEASE UNTIL: "
-                                    + latestJob
-                                    .getLeaseUntil()
+                                    + latestJob.getLeaseUntil()
                     );
 
                     System.out.println(
@@ -502,29 +467,28 @@ public class JobWorker implements SmartLifecycle {
                     );
 
                     /*
-                     * Do not process the same job while
-                     * another worker may still own it.
-                     *
                      * IMPORTANT:
                      *
-                     * We also do NOT acknowledge this
-                     * Redis message.
+                     * Do not ACK.
                      *
-                     * It remains pending and can be
-                     * considered again later.
+                     * Redis message remains pending.
                      */
                     return;
                 }
 
                 /*
-                 * Database lease has expired.
+                 * ==================================
+                 * LEASE EXPIRED
+                 * ==================================
                  *
-                 * Take ownership.
+                 * This worker can take ownership.
                  */
+
                 job =
                         latestJob;
 
-                currentJob = job;
+                currentJob =
+                        job;
 
                 job.setWorkerId(
                         workerId
@@ -534,9 +498,6 @@ public class JobWorker implements SmartLifecycle {
                         now
                 );
 
-                /*
-                 * Give the recovered job a fresh lease.
-                 */
                 job.setLeaseUntil(
                         now.plusSeconds(30)
                 );
@@ -545,14 +506,13 @@ public class JobWorker implements SmartLifecycle {
                         now
                 );
 
-                /*
-                 * Keep status PROCESSING.
-                 */
                 job.setStatus(
                         JobStatus.PROCESSING
                 );
 
-                jobRepository.save(job);
+                jobRepository.save(
+                        job
+                );
 
                 System.out.println(
                         "========================================"
@@ -573,10 +533,8 @@ public class JobWorker implements SmartLifecycle {
                 );
 
                 System.out.println(
-                        "ATTEMPT: "
-                                + (job.getAttemptCount() + 1)
-                                + "/"
-                                + job.getMaxAttempts()
+                        "PREVIOUS WORKER: "
+                                + latestJob.getWorkerId()
                 );
 
                 System.out.println(
@@ -591,7 +549,7 @@ public class JobWorker implements SmartLifecycle {
 
             /*
              * ======================================
-             * UNKNOWN DATABASE STATE
+             * UNKNOWN STATE
              * ======================================
              */
 
@@ -607,11 +565,61 @@ public class JobWorker implements SmartLifecycle {
                                 + latestJob.getStatus()
                 );
 
+                jobQueue.acknowledge(
+                        redisRecordId
+                );
+
+                return;
+            }
+
+            /*
+             * ======================================
+             * IDEMPOTENCY CHECK
+             * ======================================
+             *
+             * IMPORTANT:
+             *
+             * We do NOT simply check whether an
+             * execution record exists.
+             *
+             * A PROCESSING execution may belong to
+             * a worker that crashed.
+             *
+             * Therefore IdempotencyService must
+             * distinguish an active execution from
+             * a completed execution.
+             */
+
+            boolean executionStarted =
+                    idempotencyService.tryStartExecution(
+                            job.getId()
+                    );
+
+            if (!executionStarted) {
+
                 /*
-                 * The Redis delivery has already been
-                 * received, but the database state
-                 * cannot be processed by this worker.
+                 * The job has already been successfully
+                 * registered as an execution.
+                 *
+                 * Do not execute it again.
                  */
+                System.out.println(
+                        "========================================"
+                );
+
+                System.out.println(
+                        "DUPLICATE EXECUTION DETECTED"
+                );
+
+                System.out.println(
+                        "SKIPPING JOB: "
+                                + job.getId()
+                );
+
+                System.out.println(
+                        "========================================"
+                );
+
                 jobQueue.acknowledge(
                         redisRecordId
                 );
@@ -630,8 +638,21 @@ public class JobWorker implements SmartLifecycle {
             );
 
             System.out.println(
-                    "PROCESSING JOB: "
+                    "EXECUTING JOB"
+            );
+
+            System.out.println(
+                    "JOB: "
                             + job.getId()
+            );
+
+            System.out.println(
+                    "TYPE: "
+                            + job.getType()
+            );
+
+            System.out.println(
+                    "========================================"
             );
 
             boolean cancelled =
@@ -639,38 +660,33 @@ public class JobWorker implements SmartLifecycle {
 
             /*
              * ======================================
-             * CANCELLATION DETECTED
+             * CANCELLATION
              * ======================================
              */
 
             if (cancelled) {
 
                 System.out.println(
-                        "========================================"
-                );
-
-                System.out.println(
                         "JOB EXECUTION CANCELLED: "
                                 + job.getId()
                 );
 
-                System.out.println(
-                        "JOB WILL NOT BE COMPLETED"
-                );
-
-                System.out.println(
-                        "========================================"
-                );
-
-                /*
-                 * Cancellation is a handled outcome.
-                 */
                 jobQueue.acknowledge(
                         redisRecordId
                 );
 
                 return;
             }
+
+            /*
+             * ======================================
+             * MARK EXECUTION COMPLETED
+             * ======================================
+             */
+
+            idempotencyService.markCompleted(
+                    job.getId()
+            );
 
             /*
              * ======================================
@@ -698,15 +714,15 @@ public class JobWorker implements SmartLifecycle {
             }
 
             /*
-             * Check cancellation immediately
-             * before completion.
+             * Cancellation may have happened while
+             * the job was executing.
              */
             if (finalJob.getStatus()
                     == JobStatus.CANCELLED) {
 
                 System.out.println(
                         "CANCELLATION DETECTED "
-                                + "BEFORE COMPLETION"
+                                + "BEFORE JOB COMPLETION"
                 );
 
                 jobQueue.acknowledge(
@@ -720,18 +736,12 @@ public class JobWorker implements SmartLifecycle {
              * ======================================
              * COMPLETE JOB ATOMICALLY
              * ======================================
-             *
-             * The repository verifies:
-             *
-             * 1. Job ID
-             * 2. Worker ID
-             * 3. PROCESSING status
-             * 4. Valid lease
              */
+
             LocalDateTime completionTime =
                     LocalDateTime.now();
 
-            int updated =
+            int completed =
                     jobRepository.completeJobIfOwned(
                             job.getId(),
                             workerId,
@@ -740,14 +750,18 @@ public class JobWorker implements SmartLifecycle {
                             completionTime
                     );
 
-            if (updated == 1) {
+            if (completed == 1) {
 
                 System.out.println(
                         "========================================"
                 );
 
                 System.out.println(
-                        "COMPLETED JOB: "
+                        "JOB COMPLETED"
+                );
+
+                System.out.println(
+                        "JOB: "
                                 + job.getId()
                 );
 
@@ -756,9 +770,7 @@ public class JobWorker implements SmartLifecycle {
                 );
 
                 /*
-                 * ==================================
-                 * ACK ONLY AFTER DB COMPLETION
-                 * ==================================
+                 * ACK only after database completion.
                  */
                 jobQueue.acknowledge(
                         redisRecordId
@@ -767,15 +779,12 @@ public class JobWorker implements SmartLifecycle {
             } else {
 
                 /*
-                 * ==================================
-                 * OWNERSHIP LOST
-                 * ==================================
+                 * Ownership was lost.
                  *
-                 * DO NOT ACK.
+                 * Do NOT ACK.
                  *
-                 * Redis keeps the message pending.
-                 *
-                 * Another worker can recover it later.
+                 * Recovery can process the Redis
+                 * message again.
                  */
                 System.out.println(
                         "========================================"
@@ -786,12 +795,20 @@ public class JobWorker implements SmartLifecycle {
                 );
 
                 System.out.println(
-                        "LEASE OR OWNERSHIP LOST: "
+                        "OWNERSHIP OR LEASE LOST"
+                );
+
+                System.out.println(
+                        "JOB: "
                                 + job.getId()
                 );
 
                 System.out.println(
-                        "REDIS MESSAGE REMAINS PENDING: "
+                        "REDIS MESSAGE REMAINS PENDING"
+                );
+
+                System.out.println(
+                        "RECORD: "
                                 + redisRecordId
                 );
 
@@ -815,9 +832,6 @@ public class JobWorker implements SmartLifecycle {
                                 + job.getId()
                 );
 
-                /*
-                 * Cancellation is handled.
-                 */
                 jobQueue.acknowledge(
                         redisRecordId
                 );
@@ -825,19 +839,14 @@ public class JobWorker implements SmartLifecycle {
                 return;
             }
 
-            /*
-             * Handle RETRYING / DEAD.
-             */
             handleFailure(
                     job,
                     e
             );
 
             /*
-             * Database state has been persisted.
-             *
-             * RetryScheduler will create a new Redis
-             * message when the retry becomes eligible.
+             * RetryScheduler will create the next
+             * Redis message.
              */
             jobQueue.acknowledge(
                     redisRecordId
@@ -845,7 +854,8 @@ public class JobWorker implements SmartLifecycle {
 
         } finally {
 
-            currentJob = null;
+            currentJob =
+                    null;
 
             jobRunning.set(false);
         }
@@ -853,7 +863,7 @@ public class JobWorker implements SmartLifecycle {
 
     /*
      * ==========================================
-     * CHECK DATABASE CANCELLATION
+     * CANCELLATION CHECK
      * ==========================================
      */
 
@@ -874,10 +884,6 @@ public class JobWorker implements SmartLifecycle {
 
         } catch (Exception e) {
 
-            /*
-             * Do not incorrectly assume cancellation
-             * if PostgreSQL temporarily fails.
-             */
             System.out.println(
                     "CANCELLATION CHECK FAILED: "
                             + e.getMessage()
@@ -898,10 +904,6 @@ public class JobWorker implements SmartLifecycle {
             Exception e
     ) {
 
-        /*
-         * Check cancellation before changing
-         * the job to RETRYING or DEAD.
-         */
         if (isJobCancelled(job)) {
 
             System.out.println(
@@ -924,28 +926,26 @@ public class JobWorker implements SmartLifecycle {
                 e.getMessage()
         );
 
-        job.setWorkerId(null);
+        job.setWorkerId(
+                null
+        );
 
-        job.setClaimedAt(null);
+        job.setClaimedAt(
+                null
+        );
 
-        job.setLeaseUntil(null);
+        job.setLeaseUntil(
+                null
+        );
 
         /*
          * ======================================
-         * RETRY AVAILABLE
+         * RETRY
          * ======================================
          */
 
         if (nextAttempt < job.getMaxAttempts()) {
 
-            /*
-             * Exponential backoff:
-             *
-             * attempt 1 -> 2 sec
-             * attempt 2 -> 4 sec
-             * attempt 3 -> 8 sec
-             * attempt 4 -> 16 sec
-             */
             long delaySeconds =
                     (long) Math.pow(
                             2,
@@ -970,14 +970,20 @@ public class JobWorker implements SmartLifecycle {
                     LocalDateTime.now()
             );
 
-            jobRepository.save(job);
+            jobRepository.save(
+                    job
+            );
 
             System.out.println(
                     "========================================"
             );
 
             System.out.println(
-                    "JOB FAILED: "
+                    "JOB FAILED"
+            );
+
+            System.out.println(
+                    "JOB: "
                             + job.getId()
             );
 
@@ -994,12 +1000,6 @@ public class JobWorker implements SmartLifecycle {
             );
 
             System.out.println(
-                    "RETRY DELAY: "
-                            + delaySeconds
-                            + " seconds"
-            );
-
-            System.out.println(
                     "RETRY AT: "
                             + retryAt
             );
@@ -1012,7 +1012,7 @@ public class JobWorker implements SmartLifecycle {
 
             /*
              * ======================================
-             * NO RETRIES LEFT
+             * DEAD LETTER QUEUE
              * ======================================
              */
 
@@ -1028,14 +1028,20 @@ public class JobWorker implements SmartLifecycle {
                     LocalDateTime.now()
             );
 
-            jobRepository.save(job);
+            jobRepository.save(
+                    job
+            );
 
             System.out.println(
                     "========================================"
             );
 
             System.out.println(
-                    "JOB PERMANENTLY FAILED: "
+                    "JOB PERMANENTLY FAILED"
+            );
+
+            System.out.println(
+                    "JOB: "
                             + job.getId()
             );
 
@@ -1058,11 +1064,6 @@ public class JobWorker implements SmartLifecycle {
      * ==========================================
      * JOB EXECUTION
      * ==========================================
-     *
-     * Returns:
-     *
-     * true  -> cancelled
-     * false -> completed execution normally
      */
 
     private boolean executeJob(
@@ -1080,8 +1081,6 @@ public class JobWorker implements SmartLifecycle {
 
                 /*
                  * 15-second test job.
-                 *
-                 * Check cancellation every 500ms.
                  */
                 long totalDuration =
                         15000;
@@ -1095,11 +1094,8 @@ public class JobWorker implements SmartLifecycle {
                 while (elapsed < totalDuration) {
 
                     /*
-                     * ==================================
-                     * CHECK WORKER SHUTDOWN
-                     * ==================================
+                     * Worker shutdown.
                      */
-
                     if (!running.get()) {
 
                         System.out.println(
@@ -1108,20 +1104,12 @@ public class JobWorker implements SmartLifecycle {
                                         + job.getId()
                         );
 
-                        /*
-                         * Graceful shutdown normally waits
-                         * for this job to finish, so this
-                         * branch should rarely be reached.
-                         */
                         return false;
                     }
 
                     /*
-                     * ==================================
-                     * CHECK DATABASE CANCELLATION
-                     * ==================================
+                     * Database cancellation.
                      */
-
                     if (isJobCancelled(job)) {
 
                         System.out.println(
@@ -1162,8 +1150,7 @@ public class JobWorker implements SmartLifecycle {
                         if (isJobCancelled(job)) {
 
                             System.out.println(
-                                    "JOB CANCELLED "
-                                            + "DURING EXECUTION: "
+                                    "JOB CANCELLED DURING EXECUTION: "
                                             + job.getId()
                             );
 
@@ -1260,7 +1247,7 @@ public class JobWorker implements SmartLifecycle {
         );
 
         /*
-         * Stop accepting NEW jobs.
+         * Stop accepting new jobs.
          */
         running.set(false);
 
@@ -1269,16 +1256,12 @@ public class JobWorker implements SmartLifecycle {
         );
 
         /*
-         * Wait for the current job to finish.
-         *
-         * JobHeartbeat continues renewing the
-         * database lease while the job runs.
+         * Wait for current job.
          */
         while (jobRunning.get()) {
 
             System.out.println(
-                    "WAITING FOR CURRENT JOB "
-                            + "TO FINISH..."
+                    "WAITING FOR CURRENT JOB TO FINISH..."
             );
 
             try {
@@ -1329,3 +1312,4 @@ public class JobWorker implements SmartLifecycle {
         return jobRunning.get();
     }
 }
+
