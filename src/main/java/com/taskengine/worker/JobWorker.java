@@ -2,9 +2,11 @@ package com.taskengine.worker;
 
 import com.taskengine.entity.Job;
 import com.taskengine.enums.JobStatus;
+import com.taskengine.metrics.TaskEngineMetrics;
 import com.taskengine.queue.JobQueue;
 import com.taskengine.repository.JobRepository;
 import com.taskengine.service.IdempotencyService;
+import io.micrometer.core.instrument.Timer;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -20,6 +22,7 @@ public class JobWorker implements SmartLifecycle {
     private final JobQueue jobQueue;
     private final JobRepository jobRepository;
     private final IdempotencyService idempotencyService;
+    private final TaskEngineMetrics metrics;
 
     /*
      * true  -> worker accepts new jobs
@@ -46,7 +49,8 @@ public class JobWorker implements SmartLifecycle {
             WorkerIdentity workerIdentity,
             JobQueue jobQueue,
             JobRepository jobRepository,
-            IdempotencyService idempotencyService
+            IdempotencyService idempotencyService,
+            TaskEngineMetrics metrics
     ) {
 
         this.workerIdentity =
@@ -60,6 +64,9 @@ public class JobWorker implements SmartLifecycle {
 
         this.idempotencyService =
                 idempotencyService;
+
+        this.metrics =
+                metrics;
     }
 
     /*
@@ -130,6 +137,14 @@ public class JobWorker implements SmartLifecycle {
         if (claimedJob == null) {
             return;
         }
+
+        /*
+         * ======================================
+         * RECORD REDIS CLAIM
+         * ======================================
+         */
+
+        metrics.jobClaimed();
 
         processClaimedJob(
                 claimedJob
@@ -259,6 +274,8 @@ public class JobWorker implements SmartLifecycle {
                     redisRecordId
             );
 
+            metrics.jobCancelled();
+
             jobRunning.set(false);
 
             return;
@@ -309,6 +326,8 @@ public class JobWorker implements SmartLifecycle {
                 jobQueue.acknowledge(
                         redisRecordId
                 );
+
+                metrics.jobCancelled();
 
                 return;
             }
@@ -413,11 +432,6 @@ public class JobWorker implements SmartLifecycle {
              * ======================================
              * RECOVERED JOB
              * ======================================
-             *
-             * Redis XCLAIM transferred ownership.
-             *
-             * The PostgreSQL job should already be
-             * PROCESSING.
              */
 
             else if (recoveredJob) {
@@ -467,8 +481,6 @@ public class JobWorker implements SmartLifecycle {
                     );
 
                     /*
-                     * IMPORTANT:
-                     *
                      * Do not ACK.
                      *
                      * Redis message remains pending.
@@ -480,8 +492,6 @@ public class JobWorker implements SmartLifecycle {
                  * ==================================
                  * LEASE EXPIRED
                  * ==================================
-                 *
-                 * This worker can take ownership.
                  */
 
                 job =
@@ -489,6 +499,9 @@ public class JobWorker implements SmartLifecycle {
 
                 currentJob =
                         job;
+
+                String previousWorker =
+                        latestJob.getWorkerId();
 
                 job.setWorkerId(
                         workerId
@@ -514,6 +527,11 @@ public class JobWorker implements SmartLifecycle {
                         job
                 );
 
+                /*
+                 * Record successful recovery.
+                 */
+                metrics.jobRecovered();
+
                 System.out.println(
                         "========================================"
                 );
@@ -534,7 +552,7 @@ public class JobWorker implements SmartLifecycle {
 
                 System.out.println(
                         "PREVIOUS WORKER: "
-                                + latestJob.getWorkerId()
+                                + previousWorker
                 );
 
                 System.out.println(
@@ -576,18 +594,6 @@ public class JobWorker implements SmartLifecycle {
              * ======================================
              * IDEMPOTENCY CHECK
              * ======================================
-             *
-             * IMPORTANT:
-             *
-             * We do NOT simply check whether an
-             * execution record exists.
-             *
-             * A PROCESSING execution may belong to
-             * a worker that crashed.
-             *
-             * Therefore IdempotencyService must
-             * distinguish an active execution from
-             * a completed execution.
              */
 
             boolean executionStarted =
@@ -598,11 +604,11 @@ public class JobWorker implements SmartLifecycle {
             if (!executionStarted) {
 
                 /*
-                 * The job has already been successfully
-                 * registered as an execution.
-                 *
-                 * Do not execute it again.
+                 * Existing execution means this
+                 * execution attempt is a duplicate.
                  */
+                metrics.duplicateJob();
+
                 System.out.println(
                         "========================================"
                 );
@@ -655,8 +661,29 @@ public class JobWorker implements SmartLifecycle {
                     "========================================"
             );
 
-            boolean cancelled =
-                    executeJob(job);
+            /*
+             * Start execution timer.
+             */
+            Timer.Sample timer =
+                    Timer.start();
+
+            boolean cancelled;
+
+            try {
+
+                cancelled =
+                        executeJob(job);
+
+            } finally {
+
+                /*
+                 * Always record execution duration,
+                 * including failed/cancelled executions.
+                 */
+                timer.stop(
+                        metrics.getJobExecutionDuration()
+                );
+            }
 
             /*
              * ======================================
@@ -670,6 +697,8 @@ public class JobWorker implements SmartLifecycle {
                         "JOB EXECUTION CANCELLED: "
                                 + job.getId()
                 );
+
+                metrics.jobCancelled();
 
                 jobQueue.acknowledge(
                         redisRecordId
@@ -725,6 +754,8 @@ public class JobWorker implements SmartLifecycle {
                                 + "BEFORE JOB COMPLETION"
                 );
 
+                metrics.jobCancelled();
+
                 jobQueue.acknowledge(
                         redisRecordId
                 );
@@ -751,6 +782,12 @@ public class JobWorker implements SmartLifecycle {
                     );
 
             if (completed == 1) {
+
+                /*
+                 * Completion is counted only after
+                 * the database ownership check succeeds.
+                 */
+                metrics.jobCompleted();
 
                 System.out.println(
                         "========================================"
@@ -782,9 +819,6 @@ public class JobWorker implements SmartLifecycle {
                  * Ownership was lost.
                  *
                  * Do NOT ACK.
-                 *
-                 * Recovery can process the Redis
-                 * message again.
                  */
                 System.out.println(
                         "========================================"
@@ -832,12 +866,19 @@ public class JobWorker implements SmartLifecycle {
                                 + job.getId()
                 );
 
+                metrics.jobCancelled();
+
                 jobQueue.acknowledge(
                         redisRecordId
                 );
 
                 return;
             }
+
+            /*
+             * Record an actual execution failure.
+             */
+            metrics.jobFailed();
 
             handleFailure(
                     job,

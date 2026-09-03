@@ -2,7 +2,7 @@ package com.taskengine.worker;
 
 import com.taskengine.entity.Job;
 import com.taskengine.enums.JobStatus;
-import com.taskengine.queue.JobQueue;
+import com.taskengine.metrics.TaskEngineMetrics;
 import com.taskengine.repository.JobRepository;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -14,66 +14,126 @@ import java.util.List;
 public class RetryScheduler {
 
     private final JobRepository jobRepository;
-    private final JobQueue jobQueue;
+    private final TaskEngineMetrics metrics;
 
     public RetryScheduler(
             JobRepository jobRepository,
-            JobQueue jobQueue
+            TaskEngineMetrics metrics
     ) {
-        this.jobRepository = jobRepository;
-        this.jobQueue = jobQueue;
+
+        this.jobRepository =
+                jobRepository;
+
+        this.metrics =
+                metrics;
     }
 
     /*
-     * Check for jobs ready for retry every second.
+     * ==========================================
+     * RETRY SCHEDULER
+     * ==========================================
+     *
+     * Checks every second for jobs whose
+     * retry delay has expired.
+     *
+     * RETRYING → PENDING
+     *
+     * PriorityScheduler will then handle:
+     *
+     * PENDING → DISPATCHED → Redis
+     *
+     * This keeps retry jobs inside the same
+     * priority scheduling pipeline as new jobs.
      */
     @Scheduled(fixedDelay = 1000)
     public void processRetries() {
 
-        LocalDateTime now = LocalDateTime.now();
-
-        System.out.println(
-                "RETRY CHECK: " + now
-        );
+        LocalDateTime now =
+                LocalDateTime.now();
 
         List<Job> retryJobs =
-                jobRepository.findByStatusAndScheduledAtBefore(
-                        JobStatus.RETRYING,
-                        now
-                );
+                jobRepository
+                        .findByStatusAndScheduledAtBefore(
+                                JobStatus.RETRYING,
+                                now
+                        );
+
+        if (retryJobs.isEmpty()) {
+            return;
+        }
+
+        System.out.println(
+                "========================================"
+        );
+
+        System.out.println(
+                "RETRY SCHEDULER"
+        );
 
         System.out.println(
                 "RETRY JOBS READY: "
                         + retryJobs.size()
         );
 
+        /*
+         * ======================================
+         * PROCESS RETRY JOBS
+         * ======================================
+         */
+
         for (Job job : retryJobs) {
 
             try {
 
                 /*
-                 * ==============================
+                 * ==================================
                  * MOVE RETRYING → PENDING
-                 * ==============================
+                 * ==================================
+                 *
+                 * Do NOT enqueue directly into Redis.
+                 *
+                 * PriorityScheduler will pick this
+                 * job according to priority.
                  */
 
-                job.setStatus(JobStatus.PENDING);
-
-                job.setUpdatedAt(now);
-
-                jobRepository.save(job);
+                job.setStatus(
+                        JobStatus.PENDING
+                );
 
                 /*
-                 * ==============================
-                 * PUT JOB BACK INTO REDIS
-                 * ==============================
+                 * scheduledAt is no longer needed
+                 * once the retry becomes pending.
                  */
+                job.setScheduledAt(
+                        null
+                );
 
-                jobQueue.enqueueJob(job);
+                job.setUpdatedAt(
+                        now
+                );
+
+                jobRepository.save(
+                        job
+                );
+
+                /*
+                 * ==================================
+                 * RECORD RETRY
+                 * ==================================
+                 *
+                 * The retry was successfully released
+                 * back into the scheduling pipeline.
+                 */
+                metrics.jobRetried();
 
                 System.out.println(
-                        "RETRYING JOB REQUEUED: "
+                        "RETRY JOB MOVED TO PENDING: "
                                 + job.getId()
+                );
+
+                System.out.println(
+                        "PRIORITY: "
+                                + job.getPriority()
                 );
 
                 System.out.println(
@@ -83,18 +143,39 @@ public class RetryScheduler {
                                 + job.getMaxAttempts()
                 );
 
+                System.out.println(
+                        "WAITING FOR PRIORITY SCHEDULER"
+                );
+
             } catch (Exception e) {
 
                 System.out.println(
-                        "Failed to requeue retry job: "
+                        "========================================"
+                );
+
+                System.out.println(
+                        "RETRY SCHEDULER ERROR"
+                );
+
+                System.out.println(
+                        "JOB: "
                                 + job.getId()
                 );
 
                 System.out.println(
-                        "Error: "
+                        "ERROR: "
                                 + e.getMessage()
+                );
+
+                System.out.println(
+                        "========================================"
                 );
             }
         }
+
+        System.out.println(
+                "========================================"
+        );
     }
 }
+

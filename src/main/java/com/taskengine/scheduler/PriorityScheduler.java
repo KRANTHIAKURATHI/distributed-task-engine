@@ -2,6 +2,7 @@ package com.taskengine.scheduler;
 
 import com.taskengine.entity.Job;
 import com.taskengine.enums.JobStatus;
+import com.taskengine.metrics.TaskEngineMetrics;
 import com.taskengine.queue.JobQueue;
 import com.taskengine.repository.JobRepository;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -16,13 +17,16 @@ public class PriorityScheduler {
 
     private final JobRepository jobRepository;
     private final JobQueue jobQueue;
+    private final TaskEngineMetrics metrics;
 
     public PriorityScheduler(
             JobRepository jobRepository,
-            JobQueue jobQueue
+            JobQueue jobQueue,
+            TaskEngineMetrics metrics
     ) {
         this.jobRepository = jobRepository;
         this.jobQueue = jobQueue;
+        this.metrics = metrics;
     }
 
     /*
@@ -113,11 +117,24 @@ public class PriorityScheduler {
                 );
 
                 /*
-                 * Put the job into Redis Stream.
+                 * ==================================
+                 * PUT JOB INTO REDIS
+                 * ==================================
                  */
+
                 jobQueue.enqueue(
                         job.getId()
                 );
+
+                /*
+                 * ==================================
+                 * RECORD DISPATCH METRIC
+                 * ==================================
+                 *
+                 * Only increment after the Redis
+                 * enqueue call succeeds.
+                 */
+                metrics.jobDispatched();
 
                 System.out.println(
                         "JOB DISPATCHED TO REDIS: "

@@ -3,6 +3,7 @@ package com.taskengine.service;
 import com.taskengine.dto.CreateJobRequest;
 import com.taskengine.entity.Job;
 import com.taskengine.enums.JobStatus;
+import com.taskengine.metrics.TaskEngineMetrics;
 import com.taskengine.queue.JobQueue;
 import com.taskengine.repository.JobRepository;
 import org.springframework.data.domain.Page;
@@ -21,25 +22,30 @@ public class JobService {
 
     private final JobRepository jobRepository;
     private final JobQueue jobQueue;
+    private final TaskEngineMetrics metrics;
 
     public JobService(
             JobRepository jobRepository,
-            JobQueue jobQueue
+            JobQueue jobQueue,
+            TaskEngineMetrics metrics
     ) {
-        this.jobRepository = jobRepository;
-        this.jobQueue = jobQueue;
+
+        this.jobRepository =
+                jobRepository;
+
+        this.jobQueue =
+                jobQueue;
+
+        this.metrics =
+                metrics;
     }
 
     /*
      * ==========================================
      * CREATE JOB
      * ==========================================
-     *
-     * The job is saved to PostgreSQL first.
-     *
-     * PriorityScheduler will dispatch the job
-     * to Redis.
      */
+
     public Job createJob(
             CreateJobRequest request
     ) {
@@ -88,6 +94,12 @@ public class JobService {
         Job savedJob =
                 jobRepository.save(job);
 
+        /*
+         * Record metric only after
+         * successful database save.
+         */
+        metrics.jobCreated();
+
         System.out.println(
                 "========================================"
         );
@@ -122,9 +134,8 @@ public class JobService {
      * ==========================================
      * GET JOB BY ID
      * ==========================================
-     *
-     * GET /api/v1/jobs/{id}
      */
+
     public Job getJobById(
             UUID jobId
     ) {
@@ -143,30 +154,13 @@ public class JobService {
      * ==========================================
      * GET JOBS
      * ==========================================
-     *
-     * Supports:
-     *
-     * GET /api/v1/jobs
-     *
-     * GET /api/v1/jobs?page=0&size=10
-     *
-     * GET /api/v1/jobs?status=COMPLETED
-     *
-     * GET /api/v1/jobs?status=DEAD&page=0&size=5
-     *
-     * Jobs are sorted by newest first.
      */
+
     public Page<Job> getJobs(
             JobStatus status,
             int page,
             int size
     ) {
-
-        /*
-         * ======================================
-         * VALIDATE PAGE
-         * ======================================
-         */
 
         if (page < 0) {
 
@@ -175,12 +169,6 @@ public class JobService {
             );
         }
 
-        /*
-         * ======================================
-         * VALIDATE SIZE
-         * ======================================
-         */
-
         if (size < 1 || size > 100) {
 
             throw new IllegalArgumentException(
@@ -188,13 +176,6 @@ public class JobService {
             );
         }
 
-        /*
-         * ======================================
-         * CREATE PAGINATION
-         * ======================================
-         *
-         * Newest jobs first.
-         */
         Pageable pageable =
                 PageRequest.of(
                         page,
@@ -205,19 +186,6 @@ public class JobService {
                         )
                 );
 
-        /*
-         * ======================================
-         * STATUS FILTER
-         * ======================================
-         *
-         * If status is supplied:
-         *
-         * SELECT jobs WHERE status = ?
-         *
-         * Otherwise:
-         *
-         * SELECT all jobs.
-         */
         if (status != null) {
 
             return jobRepository.findJobsByStatus(
@@ -225,12 +193,6 @@ public class JobService {
                     pageable
             );
         }
-
-        /*
-         * ======================================
-         * ALL JOBS
-         * ======================================
-         */
 
         return jobRepository.findAll(
                 pageable
@@ -241,9 +203,8 @@ public class JobService {
      * ==========================================
      * DLQ INSPECTION
      * ==========================================
-     *
-     * Returns all DEAD jobs.
      */
+
     public List<Job> getDeadJobs() {
 
         return jobRepository.findByStatus(
@@ -255,9 +216,8 @@ public class JobService {
      * ==========================================
      * REPROCESS DEAD JOB
      * ==========================================
-     *
-     * DEAD → PENDING
      */
+
     @Transactional
     public Job reprocessJob(
             UUID jobId
@@ -272,9 +232,6 @@ public class JobService {
                                 )
                         );
 
-        /*
-         * Only DEAD jobs can be reprocessed.
-         */
         if (job.getStatus()
                 != JobStatus.DEAD) {
 
@@ -284,12 +241,6 @@ public class JobService {
                             + job.getStatus()
             );
         }
-
-        /*
-         * ======================================
-         * RESET JOB STATE
-         * ======================================
-         */
 
         job.setStatus(
                 JobStatus.PENDING
@@ -323,11 +274,6 @@ public class JobService {
                 LocalDateTime.now()
         );
 
-        /*
-         * Save PostgreSQL.
-         *
-         * PriorityScheduler will dispatch it.
-         */
         Job savedJob =
                 jobRepository.save(job);
 
@@ -366,6 +312,7 @@ public class JobService {
      * CANCEL JOB
      * ==========================================
      */
+
     @Transactional
     public Job cancelJob(
             UUID jobId
@@ -376,11 +323,10 @@ public class JobService {
 
         /*
          * ======================================
-         * STEP 1
+         * PENDING / RETRYING
          * ======================================
-         *
-         * Try to cancel PENDING or RETRYING.
          */
+
         int cancelled =
                 jobRepository.cancelPendingOrRetryingJob(
                         jobId,
@@ -391,6 +337,12 @@ public class JobService {
                 );
 
         if (cancelled == 1) {
+
+            /*
+             * Record cancellation only after
+             * the database update succeeds.
+             */
+            metrics.jobCancelled();
 
             System.out.println(
                     "JOB CANCELLED: "
@@ -404,11 +356,10 @@ public class JobService {
 
         /*
          * ======================================
-         * STEP 2
+         * PROCESSING
          * ======================================
-         *
-         * Check PROCESSING.
          */
+
         Job job =
                 jobRepository.findById(jobId)
                         .orElseThrow(
@@ -418,11 +369,6 @@ public class JobService {
                                 )
                         );
 
-        /*
-         * ======================================
-         * PROCESSING JOB
-         * ======================================
-         */
         if (job.getStatus()
                 == JobStatus.PROCESSING) {
 
@@ -447,6 +393,13 @@ public class JobService {
 
             if (processingCancelled == 1) {
 
+                /*
+                 * Record cancellation only after
+                 * ownership and lease validation
+                 * succeed.
+                 */
+                metrics.jobCancelled();
+
                 System.out.println(
                         "PROCESSING JOB CANCELLED: "
                                 + jobId
@@ -465,7 +418,7 @@ public class JobService {
 
         /*
          * ======================================
-         * OTHER STATES
+         * ALREADY CANCELLED
          * ======================================
          */
 
@@ -477,6 +430,12 @@ public class JobService {
             );
         }
 
+        /*
+         * ======================================
+         * COMPLETED
+         * ======================================
+         */
+
         if (job.getStatus()
                 == JobStatus.COMPLETED) {
 
@@ -484,6 +443,12 @@ public class JobService {
                     "Completed job cannot be cancelled"
             );
         }
+
+        /*
+         * ======================================
+         * DEAD
+         * ======================================
+         */
 
         if (job.getStatus()
                 == JobStatus.DEAD) {
@@ -501,4 +466,3 @@ public class JobService {
         );
     }
 }
-
